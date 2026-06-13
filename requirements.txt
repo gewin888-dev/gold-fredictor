@@ -1,0 +1,13 @@
+APScheduler==3.10.4
+altair==5.5.0
+fastapi==0.115.6
+httpx==0.28.1
+numpy==2.0.2
+pandas==2.2.3
+pydantic-settings==2.7.1
+pytest==8.3.4
+python-dotenv==1.0.1
+requests==2.32.3
+SQLAlchemy==2.0.36
+streamlit==1.41.1
+uvicorn==0.34.0

@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/
+.DS_Store
+gold_monitor.db
+gold_monitor.db-journal
+*.sqlite
+*.sqlite3
+*.backup.*
+*.db-wal
+*.db-shm

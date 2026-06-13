@@ -1,0 +1,45 @@
+{
+  "description": "全球主要央行月度购金数据（吨），来源：WGC Gold Demand Trends 季度报告按月估算。每月更新此文件后调用 POST /collect/cb_gold 刷新。",
+  "last_updated": "2026-06-12",
+  "source": "WGC/IMF IFS",
+  "unit": "吨",
+  "countries": {
+    "China": "中国",
+    "India": "印度",
+    "Turkey": "土耳其",
+    "Poland": "波兰",
+    "Kazakhstan": "哈萨克斯坦"
+  },
+  "reserves": {
+    "China": 2340,
+    "India": 910,
+    "Turkey": 635,
+    "Poland": 480,
+    "Kazakhstan": 410
+  },
+  "data": [
+    {"period": "2026-05", "China": 0, "India": 3, "Turkey": 15, "Poland": 7, "Kazakhstan": 2},
+    {"period": "2026-04", "China": 5, "India": 3, "Turkey": 12, "Poland": 8, "Kazakhstan": 3},
+    {"period": "2026-03", "China": 6, "India": 4, "Turkey": 18, "Poland": 8, "Kazakhstan": 3},
+    {"period": "2026-02", "China": 5, "India": 5, "Turkey": 16, "Poland": 7, "Kazakhstan": 2},
+    {"period": "2026-01", "China": 5, "India": 4, "Turkey": 14, "Poland": 9, "Kazakhstan": 3},
+    {"period": "2025-12", "China": 8, "India": 6, "Turkey": 22, "Poland": 12, "Kazakhstan": 4},
+    {"period": "2025-11", "China": 7, "India": 5, "Turkey": 20, "Poland": 10, "Kazakhstan": 3},
+    {"period": "2025-10", "China": 6, "India": 5, "Turkey": 18, "Poland": 9, "Kazakhstan": 3},
+    {"period": "2025-09", "China": 5, "India": 4, "Turkey": 8, "Poland": 7, "Kazakhstan": 3},
+    {"period": "2025-08", "China": 5, "India": 4, "Turkey": 9, "Poland": 7, "Kazakhstan": 2},
+    {"period": "2025-07", "China": 5, "India": 3, "Turkey": 8, "Poland": 6, "Kazakhstan": 2},
+    {"period": "2025-06", "China": 12, "India": 2, "Turkey": 9, "Poland": 5, "Kazakhstan": 3},
+    {"period": "2025-05", "China": 11, "India": 2, "Turkey": 10, "Poland": 5, "Kazakhstan": 2},
+    {"period": "2025-04", "China": 12, "India": 2, "Turkey": 9, "Poland": 5, "Kazakhstan": 3},
+    {"period": "2025-03", "China": 13, "India": 3, "Turkey": 12, "Poland": 7, "Kazakhstan": 4},
+    {"period": "2025-02", "China": 14, "India": 4, "Turkey": 11, "Poland": 6, "Kazakhstan": 3},
+    {"period": "2025-01", "China": 15, "India": 3, "Turkey": 12, "Poland": 7, "Kazakhstan": 3},
+    {"period": "2024-12", "China": 13, "India": 3, "Turkey": 13, "Poland": 9, "Kazakhstan": 3},
+    {"period": "2024-11", "China": 14, "India": 2, "Turkey": 14, "Poland": 8, "Kazakhstan": 3},
+    {"period": "2024-10", "China": 18, "India": 3, "Turkey": 16, "Poland": 7, "Kazakhstan": 4},
+    {"period": "2024-09", "China": 17, "India": 2, "Turkey": 8, "Poland": 6, "Kazakhstan": 3},
+    {"period": "2024-08", "China": 16, "India": 2, "Turkey": 9, "Poland": 6, "Kazakhstan": 3},
+    {"period": "2024-07", "China": 17, "India": 2, "Turkey": 8, "Poland": 6, "Kazakhstan": 4}
+  ]
+}
