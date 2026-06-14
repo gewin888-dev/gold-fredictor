@@ -31,9 +31,10 @@ from app.scoring.factor_registry import inactive_factor_reasons as registry_inac
 
 import httpx
 
-st.set_page_config(page_title="黄金走势监控", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="黄金走势监控", layout="wide", initial_sidebar_state="expanded")
 SETTINGS = get_settings()
 LOW_CONFIDENCE_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
+API_BASE_URL = "http://127.0.0.1:8000"
 
 st.markdown("""
 <style>
@@ -305,6 +306,8 @@ div[data-testid="stTable"] {
 @media (max-width: 760px) {
   .time-strip { grid-template-columns: 1fr; }
 }
+/* 窄侧边栏 */
+[data-testid="stSidebar"] { min-width: 220px !important; max-width: 230px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -354,18 +357,24 @@ def api(path: str, method: str = "get", **kw) -> dict:
     try:
         with httpx.Client(timeout=httpx.Timeout(15)) as c:
             fn = getattr(c, method.lower())
-            base = "http://localhost:8000"
+            base = API_BASE_URL
             r = fn(f"{base}{path}", **kw)
-            return r.json() if r.status_code == 200 else {}
-    except Exception:
-        return {}
+            if r.status_code == 200:
+                return r.json()
+            try:
+                body = r.json()
+                return {"ok": False, "reason": body.get("detail", f"HTTP {r.status_code}")}
+            except Exception:
+                return {"ok": False, "reason": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "reason": f"请求失败: {e}"}
 
 
 @st.cache_data(ttl=25)
 def get_gold() -> dict:
     try:
         with httpx.Client(timeout=httpx.Timeout(10)) as c:
-            r = c.get("http://localhost:8000/gold/price")
+            r = c.get(f"{API_BASE_URL}/gold/price")
             return r.json() if r.status_code == 200 else {}
     except Exception:
         db = SessionLocal()
@@ -528,11 +537,19 @@ def get_cftc() -> pd.DataFrame:
 
 @st.cache_data(ttl=40)
 def get_health() -> dict:
-    db = SessionLocal()
-    try:
-        return get_data_health(db)
-    finally:
-        db.close()
+    import time as _time
+    for attempt in range(3):
+        db = SessionLocal()
+        try:
+            result = get_data_health(db)
+            return result
+        except Exception as e:
+            if attempt < 2:
+                _time.sleep(0.5 * (attempt + 1))
+            else:
+                return {"ok": False, "error": str(e), "items": []}
+        finally:
+            db.close()
 
 
 @st.cache_data(ttl=60)
@@ -713,6 +730,22 @@ st.markdown(
 # ═══ 侧边栏 ═══
 
 with st.sidebar:
+    st.markdown("#### 🧭 模块导航")
+    st.markdown(
+        """<div style="display:flex;flex-direction:column;gap:4px;font-size:0.82rem;margin-bottom:12px">
+        <a href="#gold-score" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">📊 多空评分</a>
+        <a href="#gold-price" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">💰 金价走势</a>
+        <a href="#gold-predict" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">🔮 金价预测</a>
+        <a href="#macro-indicators" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">📈 宏观指标</a>
+        <a href="#cftc" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">📋 CFTC</a>
+        <a href="#central-bank" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">🏦 央行购金</a>
+        <a href="#macro-events" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">📅 宏观事件</a>
+        <a href="#news-sentiment" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">📰 新闻情绪</a>
+        <a href="#score-evolution" style="color:#3b82f6;text-decoration:none;padding:3px 8px;background:#eff6ff;border-radius:4px">🧬 模型进化</a>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    st.divider()
     st.markdown("### ⚙️ 自动优化")
     auto_config = api("/settings/auto-optimize")
     auto_settings = auto_config.get("settings", {})
@@ -720,7 +753,18 @@ with st.sidebar:
     new_activate = st.toggle("达标自动激活", value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", False))
     new_pred = st.toggle("预测模型自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", False))
     new_pred_activate = st.toggle("预测模型自动激活", value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", False))
-    if st.button("💾 保存", use_container_width=True):
+    # 检测是否有未保存更改
+    if "_auto_initial" not in st.session_state:
+        st.session_state["_auto_initial"] = dict(auto_settings)
+    current_toggle = {
+        "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
+        "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
+        "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
+        "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
+    }
+    has_unsaved = current_toggle != st.session_state["_auto_initial"]
+    save_label = "💾 保存" + (" ●" if has_unsaved else "")
+    if st.button(save_label, use_container_width=True):
         r = api("/settings/auto-optimize", "post", json={
             "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
             "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
@@ -728,15 +772,21 @@ with st.sidebar:
             "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
         })
         if r.get("ok"):
+            st.session_state["_auto_initial"] = current_toggle
             st.success("已保存")
             st.rerun()
     st.divider()
     saved = st.session_state.get("_auto_saved", auto_settings)
-    st.caption("⚠️ 达标自动激活已开启" if saved.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS") else "仅生成候选，需手动激活")
+    pred_auto_text = "预测候选达标后受控自动激活" if saved.get("AUTO_ACTIVATE_PREDICTION_MODEL") else "预测候选仅生成，不自动激活"
+    st.caption(pred_auto_text)
 
 
-with st.expander("模型健康", expanded=False):
-    health_payload = auto_config.get("health", {}) if isinstance(auto_config, dict) else {}
+health_payload = auto_config.get("health", {}) if isinstance(auto_config, dict) else {}
+score_ok = health_payload.get("score_sample_ready", False)
+pred_ok = health_payload.get("prediction_sample_ready", False)
+all_ok = score_ok and pred_ok
+health_label = f"模型健康 · {'✅ 正常' if all_ok else '⚠️ 需关注'} · 评分{'足' if score_ok else '不足'}/预测{'足' if pred_ok else '不足'}"
+with st.expander(health_label, expanded=False):
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("评分参数版本", health_payload.get("score_params_version", "default"))
     h2.metric("预测模型版本", health_payload.get("prediction_model_version") or "—")
@@ -744,14 +794,31 @@ with st.expander("模型健康", expanded=False):
     h4.metric("到期未评估", health_payload.get("prediction_due_pending_count", 0))
 
     h5, h6, h7, h8 = st.columns(4)
-    h5.metric("评分样本条件", "满足" if health_payload.get("score_sample_ready") else "不足")
-    h6.metric("预测样本条件", "满足" if health_payload.get("prediction_sample_ready") else "不足")
+    h5.metric("评分样本条件", "已达进化门槛" if health_payload.get("score_sample_ready") else "样本不足，暂不进化")
+    h6.metric("预测样本条件", "已达进化门槛" if health_payload.get("prediction_sample_ready") else "样本不足，暂不进化")
     h7.metric("自动搜索", "开" if (
         auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS") or auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL")
     ) else "关")
     h8.metric("自动激活", "开" if (
         auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS") or auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")
     ) else "关")
+
+    auto_evo = health_payload.get("auto_evolution") or {}
+    e_left, e_right = st.columns(2)
+    with e_left:
+        st.caption(
+            "短周期进化："
+            f"目标 {auto_evo.get('target_horizons', [1, 7, 30])} · "
+            f"样本门槛 {auto_evo.get('sample_threshold', 120)} · "
+            f"{'可进化' if auto_evo.get('can_evolve_prediction') else '样本不足'}"
+        )
+    with e_right:
+        action = auto_evo.get("last_prediction_action") or {}
+        st.caption(
+            "最近预测动作："
+            f"{action.get('action', '—')} · "
+            f"{action.get('from_version', '—')} → {action.get('to_version', '—')}"
+        )
 
     latest_score_candidate = health_payload.get("latest_score_candidate") or {}
     latest_prediction_candidate = health_payload.get("latest_prediction_candidate") or {}
@@ -830,6 +897,7 @@ with tc6:
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
 if gold.get("ok") and gold.get("price"):
+    st.markdown('<a id="gold-price"></a>', unsafe_allow_html=True)
     fr = gold.get("freshness", "stale")
     fr_icon = {"live": "🟢", "delayed": "🟡", "stale": "🔴"}.get(fr, "")
     chg = gold.get("change")
@@ -880,7 +948,7 @@ if gold.get("ok") and gold.get("price"):
             premium_delta = "展示用，不参与评分"
     elif SETTINGS.production_mode and not prem_df_for_metric.empty:
         premium_value = "待接入"
-        premium_delta = "需 SGE/LBMA 源"
+        premium_delta = "接入真实数据后可用"
     g5.metric("中国溢价", premium_value, delta=premium_delta, delta_color="off")
 
     # 第6列聚合：来源 + 更新
@@ -950,8 +1018,17 @@ if gold.get("ok") and gold.get("price"):
         db.close()
 
     # 24 小时金价走势趋势图
+    from app.data.gold_price_collector import is_comex_market_closed as _market_closed
     comex_raw = get_intraday()
-    if not comex_raw.empty:
+    # 休市且数据陈旧（>2小时）→ 跳过图表，显示提示
+    _data_stale = comex_raw.empty or (
+        not comex_raw.empty and
+        (pd.Timestamp.utcnow() - pd.to_datetime(comex_raw["timestamp"].max(), utc=True)).total_seconds() > 7200
+    )
+    if _market_closed() and _data_stale:
+        st.divider()
+        st.caption("⏸ COMEX 休市中（周末维护窗口 UTC 周六至周日 22:00），24小时走势图将在开盘后自动恢复。")
+    elif not comex_raw.empty:
         coverage_label, intraday_notes = _intraday_coverage_label(comex_raw)
         st.divider()
         col_i1, col_i2 = st.columns([4, 1])
@@ -1044,6 +1121,7 @@ else:
         factor_details = {}
     risks = json.loads(latest["风险"])
 
+    st.markdown('<a id="gold-score"></a>', unsafe_allow_html=True)
     sh_col1, sh_col2 = st.columns([4, 1])
     with sh_col1:
         st.subheader("黄金多空评分")
@@ -1079,7 +1157,7 @@ else:
         '<span style="font-size:0.78rem;color:#64748b">📖 '
         '<b>评分解读</b>：+30 以上偏多，−30 以下偏空，中间为中性。'
         f'当前评分基于 {len(factors)} 项已入库因子（利率、美元、流动性、持仓、情绪、央行等）加权计算，'
-        '正分=利多黄金，负分=利空黄金。仅供参考，不构成投资建议。</span>'
+        '正分=利多黄金，负分=利空黄金。</span>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -1206,6 +1284,7 @@ else:
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="gold-predict"></a>', unsafe_allow_html=True)
 st.subheader("金价预测")
 
 @st.cache_data(ttl=90)
@@ -1213,7 +1292,7 @@ def get_prediction() -> tuple[dict, str]:
     """返回 (data_dict, error_msg)。error_msg 为空时表示成功。"""
     try:
         with httpx.Client(timeout=httpx.Timeout(45)) as c:
-            r = c.get("http://localhost:8000/predict/gold")
+            r = c.get(f"{API_BASE_URL}/predict/gold")
             if r.status_code != 200:
                 return {}, f"API 返回状态 {r.status_code}"
             data = r.json()
@@ -1247,14 +1326,32 @@ if pred.get("ok"):
     future_pending_count = int(due_status.get("future_pending_count") or 0)
     st.caption(
         f"v2 多信号集成：模型 {pred.get('model_version', '—')}，训练源 {', '.join(pred.get('training_sources', []))}。"
-        "短期动量+评分回归，长期宏观基准+调整。仅供参考，不构成投资建议。"
+        "短期动量+评分回归，长期宏观基准+调整。"
     )
     st.caption(
         f"预测闭环状态：已评估 {evaluated_count} 条，到期待评估 {due_pending_count} 条，"
         f"待到期 {future_pending_count} 条。{due_status.get('message', '')}"
     )
+    if due_status.get("by_horizon"):
+        short_rows = [
+            row for row in due_status.get("by_horizon", [])
+            if int(row.get("horizon_days") or 0) in {1, 7, 30}
+        ]
+        if short_rows:
+            short_df = pd.DataFrame(short_rows).rename(columns={
+                "horizon_days": "期限",
+                "evaluated_count": "已评估",
+                "due_pending_count": "到期待评估",
+                "future_pending_count": "待到期",
+            })
+            st.dataframe(short_df[["期限", "已评估", "到期待评估", "待到期"]], use_container_width=True, hide_index=True)
+    if due_status.get("cannot_evolve_reasons"):
+        st.caption("短周期进化门槛：" + "；".join(due_status.get("cannot_evolve_reasons", [])))
 
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1.2, 3.8])
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 2])
+    target_evaluated = int(due_status.get("target_evaluated_count") or 0)
+    candidate_help = "1/7/30天样本少于 120 条，不建议生成候选模型。" if target_evaluated < 120 else "短周期样本条件基本满足，可生成候选模型。"
+    st.caption(candidate_help)
     with ctrl1:
         if st.button("保存本次预测", use_container_width=True):
             api("/predict/gold/snapshot", "post")
@@ -1266,10 +1363,8 @@ if pred.get("ok"):
             st.cache_data.clear()
             st.rerun()
     with ctrl3:
-        candidate_help = "评估样本少于 120 条，不建议生成候选模型。" if evaluated_count < 120 else "样本条件基本满足，可生成候选模型。"
-        st.caption(candidate_help)
         if st.button("生成候选模型", use_container_width=True):
-            r = api("/predict/models/optimize", "post", params={"n_iter": 40, "top_k": 5, "save_best": True})
+            r = api("/predict/models/optimize", "post", params={"n_iter": 40, "top_k": 5, "save_best": True, "auto_activate": bool(auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL"))})
             st.session_state["prediction_optimize_result"] = r
             st.cache_data.clear()
             st.rerun()
@@ -1278,14 +1373,19 @@ if pred.get("ok"):
         if opt_result.get("ok"):
             best = opt_result.get("best") or {}
             activation = opt_result.get("activation") or {}
+            overfit = activation.get("overfit_risk") or {}
             mode = "已自动激活" if activation.get("activated") else "等待人工激活"
             st.success(
                 f"已生成候选模型 {opt_result.get('saved_version')}："
                 f"综合分 {best.get('optimization_score')}，"
                 f"MAPE {best.get('weighted_mape_price_pct')}%，"
-                f"方向准确率 {best.get('weighted_direction_accuracy')}。"
+                f"方向准确率 {best.get('weighted_direction_accuracy')}，"
+                f"近期 {best.get('weighted_recent_direction_accuracy')}，"
+                f"相对baseline {activation.get('baseline_lift')}。"
                 f"{mode}。"
             )
+            if overfit.get("level"):
+                st.caption("过拟合检测：" + overfit.get("level", "—") + " · " + "；".join(overfit.get("warnings", [])))
             if activation.get("reasons"):
                 st.caption("自动激活判断：" + "；".join(activation.get("reasons", [])))
         else:
@@ -1334,7 +1434,7 @@ if pred.get("ok"):
             high = p.get("high", 0)
             color = "#16a34a" if p.get("return_pct", 0) > 0 else "#dc2626"
 
-            note_html = note.replace("\n", "<br>") if note else "暂无详情"
+            note_html = html.escape(note).replace("\n", "<br>") if note else "暂无详情"
 
             with cols[i]:
                 tip_class = ""
@@ -1468,7 +1568,7 @@ if pred.get("ok"):
                 ]
                 existing_cols = [c for c in show_cols if c in mdf.columns]
                 st.dataframe(mdf[existing_cols], use_container_width=True, hide_index=True)
-                st.caption("候选模型默认不自动激活。确认表现后，可调用 API：POST /predict/models/{version}/activate。")
+                st.caption("预测候选围绕 1/7/30 天方向命中率评估；开启自动激活后，只有通过样本、baseline、近期窗口、MAPE 和过拟合门控才会上线。")
 else:
     if pred_error:
         st.warning(f"预测数据加载失败：{pred_error}")
@@ -1486,6 +1586,7 @@ else:
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="macro-indicators"></a>', unsafe_allow_html=True)
 st.subheader("宏观指标")
 
 macro = get_macro()
@@ -1539,49 +1640,115 @@ with st.expander("手动录入外部指标", expanded=False):
             "GOLD_OPTION_SKEW_25D",
         }
     ]
-    if manual_candidates:
-        labels = [f"{row.get('name')} ({row.get('indicator_id')})" for row in manual_candidates]
-        selected_label = st.selectbox("指标", labels, key="manual_indicator_select")
-        selected_meta = manual_candidates[labels.index(selected_label)]
-        m1, m2, m3 = st.columns([1, 1, 1])
+    if not manual_candidates:
+        st.caption("暂无可手动录入的外部指标目录。")
+    else:
+        # ── 按类别分组，带 scored/gray 标记 ──
+        group_order = ["ETF", "期货结构", "期权", "风险事件", "实物需求"]
+        grouped: dict[str, list[dict]] = {}
+        for row in manual_candidates:
+            grouped.setdefault(row.get("category", "其他"), []).append(row)
+
+        label_to_meta: dict[str, dict] = {}
+        select_options: list[str] = []
+        for grp in group_order:
+            items = grouped.get(grp)
+            if not items:
+                continue
+            select_options.append(f"── {grp} ──")
+            for row in items:
+                scored_badge = "📊" if row.get("scored") else "⬜"
+                lbl = f"{scored_badge} {row.get('name')}  [{row.get('indicator_id')}]"
+                label_to_meta[lbl] = row
+                select_options.append(lbl)
+
+        selected_label = st.selectbox(
+            "选择指标",
+            select_options,
+            index=min(1, len(select_options)-1) if select_options and select_options[0].startswith("──") else 0,
+            key="manual_indicator_select",
+        )
+        # 跳过分组标题行
+        if selected_label.startswith("──"):
+            selected_label = next((o for o in select_options if not o.startswith("──")), select_options[-1])
+        selected_meta = label_to_meta.get(selected_label, manual_candidates[0])
+
+        # ── 显示该指标最新已入库值 ──
+        last_val = None
+        if not external_df.empty:
+            prev_rows = external_df[external_df["指标ID"] == selected_meta.get("indicator_id")]
+            if not prev_rows.empty:
+                latest = prev_rows.iloc[0]
+                last_val = latest.get("value")
+                last_ts = latest.get("timestamp", "")
+                last_src = latest.get("source", "")
+                st.caption(
+                    f"📌 最近记录: **{last_val}** {selected_meta.get('unit','')}"
+                    f" · {last_ts} · 来源: {last_src}"
+                )
+
+        # ── 输入区 ──
+        m1, m2, m3 = st.columns([5, 3, 3])
         with m1:
-            manual_value = st.number_input(f"数值（{selected_meta.get('unit') or ''}）", value=0.0, key="manual_indicator_value")
+            manual_value = st.number_input(
+                f"数值（{selected_meta.get('unit') or ''}）",
+                value=None,
+                placeholder="输入数值…",
+                key="manual_indicator_value",
+            )
         with m2:
             manual_date = st.date_input("日期", value=_now_beijing().date(), key="manual_indicator_date")
         with m3:
             manual_source = st.text_input("来源", value="MANUAL", key="manual_indicator_source")
-        manual_note = st.text_input("备注", value=str(selected_meta.get("reason") or ""), key="manual_indicator_note")
-        st.caption(str(selected_meta.get("reason") or ""))
-        if st.button("保存外部指标", use_container_width=True):
-            ts = dt.datetime.combine(manual_date, dt.time.min, tzinfo=UTC_TZ).isoformat()
-            result = api(
-                "/external/indicators",
-                "post",
-                json={
-                    "indicator_id": selected_meta.get("indicator_id"),
-                    "timestamp": ts,
-                    "value": manual_value,
-                    "source": manual_source or "MANUAL",
-                    "name": selected_meta.get("name"),
-                    "category": selected_meta.get("category"),
-                    "unit": selected_meta.get("unit"),
-                    "note": manual_note,
-                },
-            )
-            if result.get("ok"):
-                st.success("已保存外部指标")
-                st.cache_data.clear()
+        manual_note = st.text_input("备注（可选）", value="", key="manual_indicator_note")
+
+        # ── 说明 ──
+        reason = str(selected_meta.get("reason") or "")
+        score_status = "✅ 参与评分" if selected_meta.get("scored") else "⬜ 仅展示，不参与评分"
+        st.caption(f"{score_status} · {reason}")
+
+        # ── 按钮行 ──
+        b1, b2, b3 = st.columns([2, 1, 1])
+        with b1:
+            if st.button("💾 保存外部指标", use_container_width=True, type="primary"):
+                if manual_value is None:
+                    st.error("请输入数值")
+                else:
+                    ts = dt.datetime.combine(manual_date, dt.time.min, tzinfo=UTC_TZ).isoformat()
+                    result = api(
+                        "/external/indicators",
+                        "post",
+                        json={
+                            "indicator_id": selected_meta.get("indicator_id"),
+                            "timestamp": ts,
+                            "value": manual_value,
+                            "source": manual_source or "MANUAL",
+                            "name": selected_meta.get("name"),
+                            "category": selected_meta.get("category"),
+                            "unit": selected_meta.get("unit"),
+                            "note": manual_note,
+                        },
+                    )
+                    if result.get("ok"):
+                        st.toast(f"✅ 已保存 {selected_meta.get('name')}: {manual_value}", icon="✅")
+                        st.cache_data.clear()
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error(f"保存失败：{result.get('reason', '未知错误')}")
+        with b3:
+            if st.button("🔄 重置", use_container_width=True):
+                for k in list(st.session_state.keys()):
+                    if isinstance(k, str) and k.startswith("manual_indicator_"):
+                        del st.session_state[k]
                 st.rerun()
-            else:
-                st.error(result.get("reason", "保存失败"))
-    else:
-        st.caption("暂无可手动录入的外部指标目录。")
 
 # ═══════════════════════════════════════════
 # CFTC
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="cftc"></a>', unsafe_allow_html=True)
 st.subheader("CFTC 黄金期货持仓")
 cftc = get_cftc()
 if not cftc.empty:
@@ -1621,6 +1788,7 @@ else:
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="central-bank"></a>', unsafe_allow_html=True)
 st.subheader("央行购金")
 global_cb, country_cb = get_cb_gold()
 if (
@@ -1659,11 +1827,12 @@ else:
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="macro-events"></a>', unsafe_allow_html=True)
 st.subheader("宏观事件")
 events = get_events()
 if not events.empty:
     evt_df = events[["时间", "事件", "国家", "重要性"]].copy()
-    evt_df["时间"] = evt_df["时间"].apply(lambda t: t.strftime("%m-%d %H:%M") if hasattr(t, "strftime") else str(t)[:16])
+    evt_df["时间"] = evt_df["时间"].apply(lambda t: t.strftime("%Y-%m-%d %H:%M") if hasattr(t, "strftime") else str(t)[:16])
     st.dataframe(evt_df, use_container_width=True, hide_index=True)
 else:
     st.caption("未来60天暂无宏观事件。")
@@ -1673,6 +1842,7 @@ else:
 # ═══════════════════════════════════════════
 
 st.divider()
+st.markdown('<a id="news-sentiment"></a>', unsafe_allow_html=True)
 st.subheader("新闻情绪")
 sent_score, sent_df = get_sentiment()
 st.caption(f"生产新闻源：NewsAPI（每日限额 {SETTINGS.newsapi_daily_limit} 次）；兼容展示 GDELT。密钥来自 .env，不在页面暴露。")
@@ -1694,7 +1864,7 @@ if sent_score is not None:
         fig_sent.update_layout(
             **PLOTLY_LIGHT_LAYOUT,
             height=140, margin=dict(l=0,r=0,t=0,b=20),
-            xaxis=dict(tickformat="%H:%M", dtick=600000, showgrid=False),
+            xaxis=dict(tickformat="%m/%d %H:%M", dtick=600000, showgrid=False),
             yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
             hovermode="x unified", showlegend=False
         )
@@ -1710,9 +1880,9 @@ if sent_score is not None:
             def _make_link(row):
                 url = row.get("来源", "")
                 title = row["标题"]
-                if url and str(url).startswith("http"):
-                    return f'<a href="{url}" target="_blank">{title}</a>'
-                return title
+                if url and (str(url).startswith("http://") or str(url).startswith("https://")):
+                    return f'<a href="{html.escape(url, quote=True)}" target="_blank">{html.escape(title)}</a>'
+                return html.escape(title)
             show["标题"] = show.apply(_make_link, axis=1)
             show["情绪"] = show["情绪"].apply(lambda x: f"{x:+.2f}")
             st.write(
@@ -1725,6 +1895,7 @@ else:
     st.caption("暂无 NewsAPI/GDELT 新闻情绪数据。")
 
 # ═══════════════════════════════════════════
+st.markdown('<a id="score-evolution"></a>', unsafe_allow_html=True)
 # 评分模型自我进化
 # ═══════════════════════════════════════════
 
@@ -1748,7 +1919,7 @@ with st.expander("评分模型自我进化", expanded=False):
             import httpx
             try:
                 resp = httpx.post(
-                    "http://localhost:8000/score/optimize",
+                    f"{API_BASE_URL}/score/optimize",
                     params={"n_iter": n_iter, "horizon_days": horizon_days},
                     timeout=httpx.Timeout(600),
                 )
