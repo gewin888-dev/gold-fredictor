@@ -21,6 +21,7 @@ from app.models import (
     CentralBankGold,
     ChinaGoldPremium,
     CftcPosition,
+    ExternalMarketIndicator,
     GoldPrice,
     GoldScoreSnapshot,
     MacroObservation,
@@ -399,9 +400,9 @@ def test_cftc_decay_between_14_and_35_days(db):
 
 
 def test_china_premium_untrusted_source_skipped(db):
-    """SINA-sourced China premium must not score."""
+    """Non-trusted source (MANUAL/UNKNOWN) China premium must not score."""
     _add_required(db)
-    db.add(ChinaGoldPremium(timestamp=NOW, premium_pct=2.5, source="SINA"))
+    db.add(ChinaGoldPremium(timestamp=NOW, premium_pct=2.5, source="MANUAL"))
     db.commit()
     result = compute_gold_score(db)
     assert "中国溢价" not in result.factor_scores
@@ -416,6 +417,34 @@ def test_china_premium_expired_skipped(db):
     db.commit()
     result = compute_gold_score(db)
     assert "中国溢价" not in result.factor_scores
+
+
+def test_manual_gray_factors_remain_unscored_by_registry(db):
+    """Manual-only gray factors are displayed but must not affect score totals."""
+    _add_required(db)
+    for indicator_id, name, value in [
+        ("COMEX_REGISTERED_GOLD_OZ", "COMEX库存", 1_000_000),
+        ("COMEX_GOLD_FRONT_SPREAD_PCT", "COMEX期限结构", 1.5),
+        ("GEO_RISK_INTENSITY", "地缘风险", 8),
+        ("INDIA_CHINA_PHYSICAL_DEMAND", "实物需求", 7),
+    ]:
+        db.add(
+            ExternalMarketIndicator(
+                indicator_id=indicator_id,
+                name=name,
+                category="manual_gray",
+                timestamp=NOW,
+                value=float(value),
+                unit="",
+                source="TEST",
+            )
+        )
+    db.commit()
+
+    result = compute_gold_score(db)
+
+    for name in ["COMEX库存", "COMEX期限结构", "地缘风险", "实物需求"]:
+        assert name not in result.factor_scores
 
 
 def test_china_premium_formula(db):

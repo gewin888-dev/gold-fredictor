@@ -6,8 +6,11 @@ from typing import Any
 
 import pandas as pd
 import requests
+import urllib3
 
 from app.config import get_settings
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
@@ -23,12 +26,22 @@ class FredSeriesConfig:
 
 FRED_SERIES: list[FredSeriesConfig] = [
     FredSeriesConfig("DGS10", "美国 10 年期国债收益率", "percent", "daily"),
+    FredSeriesConfig("DFII5", "美国 5 年期 TIPS 实际收益率", "percent", "daily"),
     FredSeriesConfig("DFII10", "美国 10 年期 TIPS 实际收益率", "percent", "daily"),
+    FredSeriesConfig("DFII30", "美国 30 年期 TIPS 实际收益率", "percent", "daily"),
     FredSeriesConfig("T10YIE", "10 年通胀预期", "percent", "daily"),
     FredSeriesConfig("FEDFUNDS", "联邦基金利率", "percent", "monthly"),
     FredSeriesConfig("VIXCLS", "VIX 恐慌指数", "index", "daily"),
     FredSeriesConfig("DTWEXBGS", "美元广义贸易加权指数", "index", "daily"),
     FredSeriesConfig("SP500", "标普 500 指数", "index", "daily"),
+    FredSeriesConfig("GVZCLS", "CBOE 黄金 ETF 波动率指数", "index", "daily"),
+    FredSeriesConfig("THREEFYTP10", "10 年期美债期限溢价", "percent", "daily"),
+    FredSeriesConfig("WALCL", "美联储总资产", "millions_usd", "weekly"),
+    FredSeriesConfig("WDTGAL", "美国财政部一般账户余额", "millions_usd", "weekly"),
+    FredSeriesConfig("RRPONTSYD", "隔夜逆回购使用量", "billions_usd", "daily"),
+    FredSeriesConfig("WRESBAL", "存款机构准备金余额", "billions_usd", "weekly"),
+    FredSeriesConfig("FYFSD", "美国联邦财政盈余/赤字", "millions_usd", "annual"),
+    FredSeriesConfig("GFDEGDQ188S", "美国联邦债务/GDP", "percent", "quarterly"),
 ]
 
 
@@ -46,6 +59,7 @@ class FredClient:
             f"{FRED_BASE_URL}/{path}",
             params={**params, "api_key": self.api_key, "file_type": "json"},
             timeout=self.timeout,
+            verify=False,
         )
         response.raise_for_status()
         payload = response.json()

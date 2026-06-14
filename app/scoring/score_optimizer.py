@@ -23,14 +23,25 @@ from app.models import (
     GoldPrice,
     GoldScoreSnapshot,
     MacroObservation,
+    ExternalMarketIndicator,
     ScoreParamsVersion,
 )
 from app.scoring.gold_score import (
+    BANK_RESERVES,
     DOLLAR,
+    DEBT_TO_GDP,
+    FED_BALANCE_SHEET,
+    FEDERAL_DEFICIT,
     INFLATION_EXPECTATION,
     NOMINAL_RATE,
     FED_RATE,
+    GOLD_VOLATILITY,
     REAL_RATE,
+    REAL_RATE_5Y,
+    REAL_RATE_30Y,
+    TERM_PREMIUM_10Y,
+    TREASURY_GENERAL_ACCOUNT,
+    OVERNIGHT_RRP,
     VIX,
     _cftc_position_score,
     _clamp,
@@ -53,6 +64,12 @@ class ScoreParams:
     inflation_coef: float = 25.0
     cftc_coef: float = 30.0
     fed_rate_coef: float = 20.0
+    real_curve_coef: float = 28.0
+    term_premium_coef: float = 18.0
+    liquidity_coef: float = 1.0
+    fiscal_coef: float = 1.0
+    etf_flow_coef: float = 0.35
+    option_vol_coef: float = 1.0
 
     # 各因子截断范围
     real_rate_clamp_low: float = -25.0
@@ -65,6 +82,18 @@ class ScoreParams:
     inflation_clamp_high: float = 15.0
     cftc_clamp_low: float = -15.0
     cftc_clamp_high: float = 15.0
+    real_curve_clamp_low: float = -20.0
+    real_curve_clamp_high: float = 20.0
+    term_premium_clamp_low: float = -12.0
+    term_premium_clamp_high: float = 12.0
+    liquidity_clamp_low: float = -12.0
+    liquidity_clamp_high: float = 12.0
+    fiscal_clamp_low: float = -10.0
+    fiscal_clamp_high: float = 10.0
+    etf_flow_clamp_low: float = -12.0
+    etf_flow_clamp_high: float = 12.0
+    option_vol_clamp_low: float = -8.0
+    option_vol_clamp_high: float = 8.0
 
     # 趋势均线窗口
     trend_ma_short: int = 20
@@ -101,8 +130,13 @@ PARAM_SPACE: dict[str, list[float | int]] = {
     "vix_coef":              [0.5, 1.0, 1.5, 2.0, 2.5],
     "inflation_coef":        [10, 15, 20, 25, 30, 35],
     "cftc_coef":             [15, 20, 25, 30, 35, 40],
-    "nominal_rate_coef":     [20, 30, 40, 50, 60],
     "fed_rate_coef":         [10, 15, 20, 25, 30],
+    "real_curve_coef":       [18, 22, 28, 34, 40],
+    "term_premium_coef":     [10, 14, 18, 22, 26],
+    "liquidity_coef":        [0.5, 0.8, 1.0, 1.2, 1.5],
+    "fiscal_coef":           [0.5, 0.8, 1.0, 1.2, 1.5],
+    "etf_flow_coef":         [0.15, 0.25, 0.35, 0.45, 0.6],
+    "option_vol_coef":       [0.6, 0.8, 1.0, 1.2, 1.5],
     "trend_ma_short_weight": [4, 6, 8, 10, 12, 14],
     "trend_ma_long_weight":  [6, 8, 10, 12, 14, 16, 18],
     "bullish_threshold":     [15, 20, 25, 30, 35, 40],
@@ -121,6 +155,7 @@ def compute_score_at_date(
     merged: pd.DataFrame,
     params: ScoreParams,
     cftc_cache: dict[pd.Timestamp, tuple[float | None, str | None]] | None = None,
+    etf_flow_cache: dict[pd.Timestamp, float] | None = None,
 ) -> float:
     """用指定参数计算某个日期的多空评分（不写库）。
 
@@ -238,6 +273,106 @@ def compute_score_at_date(
         if cftc_score is not None:
             factor_sum += cftc_score
 
+    # 实际收益率曲线
+    real_curve_cols = [col for col in (REAL_RATE_5Y, REAL_RATE, REAL_RATE_30Y) if col in hist.columns]
+    if len(real_curve_cols) >= 2:
+        curve_changes = []
+        for col in real_curve_cols:
+            clean = hist[[col]].dropna()
+            if len(clean) > params.trend_ma_short:
+                curve_changes.append(float(clean[col].iloc[-1] - clean[col].iloc[-1 - params.trend_ma_short]))
+        if curve_changes:
+            avg_change = sum(curve_changes) / len(curve_changes)
+            slope_score = 0.0
+            if REAL_RATE_5Y in hist.columns and REAL_RATE_30Y in hist.columns:
+                clean = hist[[REAL_RATE_5Y, REAL_RATE_30Y]].dropna()
+                if len(clean) > params.trend_ma_short:
+                    latest_slope = float(clean[REAL_RATE_30Y].iloc[-1] - clean[REAL_RATE_5Y].iloc[-1])
+                    old_slope = float(
+                        clean[REAL_RATE_30Y].iloc[-1 - params.trend_ma_short]
+                        - clean[REAL_RATE_5Y].iloc[-1 - params.trend_ma_short]
+                    )
+                    slope_score = (latest_slope - old_slope) * 8
+            factor_sum += _clamp(
+                -avg_change * params.real_curve_coef + slope_score,
+                params.real_curve_clamp_low,
+                params.real_curve_clamp_high,
+            )
+
+    # 美债期限溢价
+    if TERM_PREMIUM_10Y in hist.columns:
+        clean = hist[[TERM_PREMIUM_10Y]].dropna()
+        if len(clean) > params.trend_ma_short:
+            premium_change = float(clean[TERM_PREMIUM_10Y].iloc[-1] - clean[TERM_PREMIUM_10Y].iloc[-1 - params.trend_ma_short])
+            factor_sum += _clamp(
+                premium_change * params.term_premium_coef,
+                params.term_premium_clamp_low,
+                params.term_premium_clamp_high,
+            )
+
+    # 美元流动性
+    liquidity_parts: list[float] = []
+    for col, weight in [
+        (FED_BALANCE_SHEET, 0.7),
+        (BANK_RESERVES, 0.5),
+        (TREASURY_GENERAL_ACCOUNT, -0.35),
+        (OVERNIGHT_RRP, -0.25),
+    ]:
+        if col not in hist.columns:
+            continue
+        clean = hist[[col]].dropna()
+        if len(clean) > params.trend_ma_short:
+            base = float(clean[col].iloc[-1 - params.trend_ma_short])
+            if base:
+                pct = (float(clean[col].iloc[-1]) / base - 1) * 100
+                liquidity_parts.append(pct * weight)
+    if liquidity_parts:
+        factor_sum += _clamp(
+            sum(liquidity_parts) * params.liquidity_coef,
+            params.liquidity_clamp_low,
+            params.liquidity_clamp_high,
+        )
+
+    # 财政压力
+    fiscal_parts: list[float] = []
+    if DEBT_TO_GDP in hist.columns:
+        clean = hist[[DEBT_TO_GDP]].dropna()
+        if len(clean) > 1:
+            idx = min(params.trend_ma_long, len(clean) - 1)
+            fiscal_parts.append((float(clean[DEBT_TO_GDP].iloc[-1]) - float(clean[DEBT_TO_GDP].iloc[-1 - idx])) * 1.2)
+    if FEDERAL_DEFICIT in hist.columns:
+        clean = hist[[FEDERAL_DEFICIT]].dropna()
+        if len(clean) > 1:
+            idx = min(252, len(clean) - 1)
+            fiscal_parts.append(-(float(clean[FEDERAL_DEFICIT].iloc[-1]) - float(clean[FEDERAL_DEFICIT].iloc[-1 - idx])) / 200000)
+    if fiscal_parts:
+        factor_sum += _clamp(
+            sum(fiscal_parts) * params.fiscal_coef,
+            params.fiscal_clamp_low,
+            params.fiscal_clamp_high,
+        )
+
+    # 期权隐含波动率（GVZ 代理）
+    if GOLD_VOLATILITY in hist.columns:
+        clean = hist[[GOLD_VOLATILITY]].dropna()
+        if len(clean) > params.trend_ma_short:
+            gvz_now = float(clean[GOLD_VOLATILITY].iloc[-1])
+            gvz_ma = float(clean[GOLD_VOLATILITY].tail(params.trend_ma_short).mean())
+            gvz_change = gvz_now - float(clean[GOLD_VOLATILITY].iloc[-1 - params.trend_ma_short])
+            option_score = ((gvz_now - gvz_ma) * 0.25 + gvz_change * 0.35) * params.option_vol_coef
+            factor_sum += _clamp(option_score, params.option_vol_clamp_low, params.option_vol_clamp_high)
+
+    # ETF 资金流（若存在历史授权/官方入库值）
+    if etf_flow_cache is not None:
+        key = target_date.normalize()
+        value = etf_flow_cache.get(key)
+        if value is not None:
+            factor_sum += _clamp(
+                value * params.etf_flow_coef,
+                params.etf_flow_clamp_low,
+                params.etf_flow_clamp_high,
+            )
+
     return round(float(_clamp(factor_sum, -100, 100)), 2)
 
 
@@ -274,7 +409,24 @@ def evaluate_params(
     gold_df = gold_df.sort_values("timestamp").set_index("timestamp")
 
     # 加载所有评分所需序列并 merge
-    series_ids = [REAL_RATE, INFLATION_EXPECTATION, VIX, DOLLAR, NOMINAL_RATE, FED_RATE]
+    series_ids = [
+        REAL_RATE,
+        INFLATION_EXPECTATION,
+        VIX,
+        DOLLAR,
+        NOMINAL_RATE,
+        FED_RATE,
+        REAL_RATE_5Y,
+        REAL_RATE_30Y,
+        TERM_PREMIUM_10Y,
+        FED_BALANCE_SHEET,
+        TREASURY_GENERAL_ACCOUNT,
+        OVERNIGHT_RRP,
+        BANK_RESERVES,
+        FEDERAL_DEFICIT,
+        DEBT_TO_GDP,
+        GOLD_VOLATILITY,
+    ]
     frames: dict[str, pd.DataFrame] = {}
     for sid in series_ids:
         df = _series_frame(db, sid)
@@ -318,6 +470,15 @@ def evaluate_params(
         score = round(_clamp(net_ratio * params.cftc_coef, params.cftc_clamp_low, params.cftc_clamp_high), 2)
         cftc_cache[pd.Timestamp(row.timestamp).normalize()] = (score, None)
 
+    etf_flow_cache: dict[pd.Timestamp, float] = {}
+    etf_rows = db.scalars(
+        select(ExternalMarketIndicator)
+        .where(ExternalMarketIndicator.indicator_id == "GLD_FLOW_TONNES")
+        .order_by(ExternalMarketIndicator.timestamp.asc())
+    ).all()
+    for row in etf_rows:
+        etf_flow_cache[pd.Timestamp(row.timestamp).normalize()] = float(row.value)
+
     # 可用评分日期
     min_required = params.trend_ma_long + 20
     all_dates = merged["timestamp"].dt.tz_localize(None).sort_values().tolist()
@@ -330,7 +491,7 @@ def evaluate_params(
     gold_prices = gold_df["gold_price"].to_dict()
     records = []
     for dt in eligible_dates:
-        score = compute_score_at_date(db, dt, merged.copy(), params, cftc_cache)
+        score = compute_score_at_date(db, dt, merged.copy(), params, cftc_cache, etf_flow_cache)
         gold_at_dt = gold_prices.get(dt)
         if gold_at_dt is None:
             continue
@@ -360,6 +521,8 @@ def evaluate_params(
 
     df = pd.DataFrame(records)
     directional = df[df["signal"] != 0]
+    long_signals = int((directional["signal"] > 0).sum()) if not directional.empty else 0
+    short_signals = int((directional["signal"] < 0).sum()) if not directional.empty else 0
 
     if directional.empty:
         bull_baseline = float((df["return_pct"] > 0).mean())
@@ -368,7 +531,11 @@ def evaluate_params(
             "hit_rate": None,
             "sample_count": len(df),
             "signal_count": 0,
+            "long_signal_count": 0,
+            "short_signal_count": 0,
+            "signal_ratio": 0.0,
             "avg_return": round(float(df["return_pct"].mean()), 4),
+            "worst_decile_return": round(float(df["return_pct"].quantile(0.10)), 4),
             "bull_baseline_hit_rate": round(bull_baseline, 4),
         }
 
@@ -380,15 +547,33 @@ def evaluate_params(
         ).mean()
     )
     bull_baseline = float((df["return_pct"] > 0).mean())
+    signed_returns = directional["return_pct"] * directional["signal"]
+    sorted_dates = df["date"].sort_values().tolist()
+    first_cut = sorted_dates[len(sorted_dates) // 2]
+    recent_directional = directional[directional["date"] >= first_cut]
+    recent_hit_rate = None
+    if not recent_directional.empty:
+        recent_hit_rate = float(
+            recent_directional.apply(
+                lambda r: (r["signal"] > 0 and r["return_pct"] > 0)
+                or (r["signal"] < 0 and r["return_pct"] < 0),
+                axis=1,
+            ).mean()
+        )
 
     return {
         "ok": True,
         "hit_rate": round(hit_rate, 4),
         "sample_count": len(df),
         "signal_count": len(directional),
+        "long_signal_count": long_signals,
+        "short_signal_count": short_signals,
         "signal_ratio": round(len(directional) / len(df), 4),
-        "avg_return": round(float(directional["return_pct"].mean()), 4),
+        "avg_return": round(float(signed_returns.mean()), 4),
+        "worst_decile_return": round(float(signed_returns.quantile(0.10)), 4),
         "bull_baseline_hit_rate": round(bull_baseline, 4),
+        "baseline_lift": round(hit_rate - bull_baseline, 4),
+        "recent_hit_rate": round(recent_hit_rate, 4) if recent_hit_rate is not None else None,
     }
 
 
@@ -436,13 +621,130 @@ def optimize_score_params(
             }
         )
 
-    # 按 hit_rate 排序（None 排后面）
-    def sort_key(r: dict) -> float:
+    baseline = next((r for r in results if r["label"] == "baseline"), None)
+    baseline_hit_rate = baseline.get("hit_rate") if baseline else None
+    for row in results:
+        if row.get("hit_rate") is not None and baseline_hit_rate is not None:
+            row["baseline_lift"] = round(float(row["hit_rate"]) - float(baseline_hit_rate), 4)
+        row["activation_check"] = score_params_activation_decision(row, baseline_hit_rate)
+
+    def sort_key(r: dict) -> tuple[float, float, float, float]:
         hr = r.get("hit_rate")
-        return hr if hr is not None else -999
+        lift = r.get("baseline_lift")
+        signal_ratio = r.get("signal_ratio")
+        worst = r.get("worst_decile_return")
+        return (
+            float(hr) if hr is not None else -999.0,
+            float(lift) if lift is not None else -999.0,
+            float(signal_ratio) if signal_ratio is not None else -999.0,
+            float(worst) if worst is not None else -999.0,
+        )
 
     results.sort(key=sort_key, reverse=True)
-    return results[:top_k + 2]  # 返回 top_k + baseline（如排到外面）
+    top = results[:top_k]
+    if baseline is not None and baseline not in top:
+        top.append(baseline)
+    return top
+
+
+def score_params_activation_decision(
+    result: dict[str, Any],
+    baseline_hit_rate: float | None = None,
+    *,
+    min_samples: int = 120,
+    min_signal_ratio: float = 0.20,
+    min_baseline_lift: float = 0.03,
+    min_long_signals: int = 10,
+    min_short_signals: int = 10,
+) -> dict[str, Any]:
+    """评分参数候选激活门控。默认只供报告和显式授权自动激活使用。"""
+    reasons: list[str] = []
+    eligible = True
+
+    sample_count = int(result.get("sample_count") or 0)
+    signal_ratio = float(result.get("signal_ratio") or 0.0)
+    long_count = int(result.get("long_signal_count") or 0)
+    short_count = int(result.get("short_signal_count") or 0)
+    hit_rate = result.get("hit_rate")
+    if sample_count < min_samples:
+        eligible = False
+        reasons.append(f"sample_count {sample_count} < {min_samples}")
+    if signal_ratio < min_signal_ratio:
+        eligible = False
+        reasons.append(f"signal_ratio {signal_ratio:.2f} < {min_signal_ratio:.2f}")
+    if long_count < min_long_signals:
+        eligible = False
+        reasons.append(f"long_signal_count {long_count} < {min_long_signals}")
+    if short_count < min_short_signals:
+        eligible = False
+        reasons.append(f"short_signal_count {short_count} < {min_short_signals}")
+    if hit_rate is None:
+        eligible = False
+        reasons.append("hit_rate missing")
+    elif baseline_hit_rate is not None and float(hit_rate) - float(baseline_hit_rate) < min_baseline_lift:
+        eligible = False
+        reasons.append(
+            f"baseline_lift {float(hit_rate) - float(baseline_hit_rate):.3f} < {min_baseline_lift:.3f}"
+        )
+    recent_hit_rate = result.get("recent_hit_rate")
+    if recent_hit_rate is not None and hit_rate is not None and float(recent_hit_rate) + 0.05 < float(hit_rate):
+        eligible = False
+        reasons.append("recent window degraded materially")
+    if eligible:
+        reasons.append("all thresholds passed")
+    return {
+        "eligible": eligible,
+        "reasons": reasons,
+        "thresholds": {
+            "min_samples": min_samples,
+            "min_signal_ratio": min_signal_ratio,
+            "min_baseline_lift": min_baseline_lift,
+            "min_long_signals": min_long_signals,
+            "min_short_signals": min_short_signals,
+        },
+    }
+
+
+def overfit_risk_assessment(result: dict[str, Any], baseline: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Heuristic overfit risk flags for human review."""
+    warnings: list[str] = []
+    hit_rate = result.get("hit_rate")
+    baseline_hit = baseline.get("hit_rate") if baseline else result.get("bull_baseline_hit_rate")
+    sample_count = int(result.get("sample_count") or 0)
+    signal_count = int(result.get("signal_count") or 0)
+    long_count = int(result.get("long_signal_count") or 0)
+    short_count = int(result.get("short_signal_count") or 0)
+    recent_hit_rate = result.get("recent_hit_rate")
+    worst_decile = result.get("worst_decile_return")
+    stored_hit_rate = result.get("stored_hit_rate")
+
+    if hit_rate is not None and float(hit_rate) >= 0.90:
+        warnings.append("命中率高于 90%，需要重点检查是否过拟合或样本区间过于单一。")
+    if stored_hit_rate is not None and float(stored_hit_rate) >= 0.90:
+        warnings.append("保存时命中率高于 90%，需要复核搜索过程是否过拟合。")
+    if stored_hit_rate is not None and hit_rate is not None and float(stored_hit_rate) - float(hit_rate) >= 0.10:
+        warnings.append("保存指标与当前统一口径复核差距超过 10 个百分点，存在口径漂移或过拟合风险。")
+    if hit_rate is not None and baseline_hit is not None and float(hit_rate) - float(baseline_hit) >= 0.25:
+        warnings.append("相对 baseline 提升超过 25 个百分点，建议做分段/滚动窗口复核。")
+    if sample_count < 120:
+        warnings.append("总样本数不足 120，候选稳定性较弱。")
+    if signal_count and min(long_count, short_count) / max(1, signal_count) < 0.15:
+        warnings.append("多空信号分布不均衡，可能只适合单边行情。")
+    if recent_hit_rate is not None and hit_rate is not None and float(recent_hit_rate) + 0.05 < float(hit_rate):
+        warnings.append("最近窗口表现弱于总体表现，存在退化迹象。")
+    if worst_decile is not None and float(worst_decile) < -5:
+        warnings.append("最差分位方向收益低于 -5%，尾部风险偏高。")
+
+    level = "low"
+    if len(warnings) >= 2:
+        level = "high"
+    elif warnings:
+        level = "medium"
+    return {
+        "level": level,
+        "warnings": warnings or ["未触发明显过拟合警告，但仍需人工审核。"],
+        "not_recommended_for_direct_activation": level != "low",
+    }
 
 
 def save_best_params(
@@ -499,6 +801,17 @@ def activate_version(db: Session, version: str) -> ScoreParamsVersion | None:
     db.commit()
     db.refresh(target)
     return target
+
+
+def deactivate_all_versions(db: Session) -> int:
+    """停用所有评分参数版本，恢复默认 rule_v2 评分。"""
+    rows = db.scalars(
+        select(ScoreParamsVersion).where(ScoreParamsVersion.is_active == True)  # noqa: E712
+    ).all()
+    for row in rows:
+        row.is_active = False
+    db.commit()
+    return len(rows)
 
 
 def get_active_params(db: Session) -> ScoreParams | None:

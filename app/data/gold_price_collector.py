@@ -35,6 +35,14 @@ def _safe_float(val: Any) -> float | None:
     return round(float(val), 2)
 
 
+def is_comex_market_closed(now_utc: datetime | None = None) -> bool:
+    """Return True during the regular COMEX weekend maintenance window."""
+    now = now_utc or datetime.now(timezone.utc)
+    weekday = now.weekday()
+    hour = now.hour
+    return weekday == 5 or (weekday == 6 and hour < 22) or (weekday == 4 and hour >= 21)
+
+
 def fetch_gold_history(days: int = 200, ticker: str = GOLD_TICKER) -> list[dict[str, Any]]:
     """下载历史金价日线数据，存入 GoldPrice 表。
 
@@ -256,13 +264,18 @@ def fetch_gold_intraday(ticker: str = GOLD_TICKER, interval_minutes: int = 5) ->
                 return {"ok": False, "error": "日内数据不足以生成图表", "ticker": ticker}
 
             current_price = float(df["close"].iloc[-1])
+            first_ts = agg.index[0]
+            last_ts = agg.index[-1]
+            coverage_hours = max(0.0, (last_ts - first_ts).total_seconds() / 3600)
+            flat = bool(float(df["close"].max()) == float(df["close"].min()))
             points = [
                 {
-                    "time": idx.strftime("%H:%M"),
-                    "open": round(row["open"], 2),
-                    "high": round(row["high"], 2),
-                    "low": round(row["low"], 2),
-                    "close": round(row["close"], 2),
+                    "timestamp": idx.isoformat(),
+                    "time": idx.strftime("%m/%d %H:%M"),
+                    "open": round(float(row["open"]), 2),
+                    "high": round(float(row["high"]), 2),
+                    "low": round(float(row["low"]), 2),
+                    "close": round(float(row["close"]), 2),
                 }
                 for idx, row in agg.iterrows()
             ]
@@ -272,6 +285,10 @@ def fetch_gold_intraday(ticker: str = GOLD_TICKER, interval_minutes: int = 5) ->
                 "ticker": ticker,
                 "current_price": round(current_price, 2),
                 "interval_minutes": interval_minutes,
+                "point_count": len(points),
+                "coverage_hours": round(coverage_hours, 2),
+                "is_flat": flat,
+                "market_closed": is_comex_market_closed(),
                 "points": points,
                 "freshness": "delayed",
             }
@@ -478,11 +495,8 @@ def _intraday_recorder_loop():
             weekday = now.weekday()  # 0=Mon, 6=Sun
             hour = now.hour
 
-            # COMEX 活跃时段：周日 22:00 UTC - 周五 21:00 UTC
-            # 简化：只在周六全天跳过，周日 22:00 前也跳过
-            if weekday == 5:  # 周六 → 跳过
-                pass
-            else:
+            # COMEX 活跃时段约为周日 22:00 UTC - 周五 21:00 UTC。
+            if not is_comex_market_closed(now):
                 record_intraday_snapshot()
         except Exception:
             pass  # 静默处理，不中断线程

@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     auto_optimize_min_hit_rate: float = Field(default=0.55, alias="AUTO_OPTIMIZE_MIN_HIT_RATE")
     auto_optimize_n_iter: int = Field(default=80, alias="AUTO_OPTIMIZE_N_ITER")
     auto_optimize_horizon_days: int = Field(default=20, alias="AUTO_OPTIMIZE_HORIZON_DAYS")
+    auto_optimize_prediction_model: bool = Field(default=False, alias="AUTO_OPTIMIZE_PREDICTION_MODEL")
+    auto_activate_prediction_model: bool = Field(default=False, alias="AUTO_ACTIVATE_PREDICTION_MODEL")
+    auto_prediction_n_iter: int = Field(default=80, alias="AUTO_PREDICTION_N_ITER")
+    auto_prediction_min_score: float = Field(default=40.0, alias="AUTO_PREDICTION_MIN_SCORE")
+    auto_prediction_max_mape_pct: float = Field(default=8.0, alias="AUTO_PREDICTION_MAX_MAPE_PCT")
+    auto_prediction_min_direction_accuracy: float = Field(default=0.52, alias="AUTO_PREDICTION_MIN_DIRECTION_ACCURACY")
+    auto_prediction_min_samples: int = Field(default=120, alias="AUTO_PREDICTION_MIN_SAMPLES")
+    auto_prediction_min_valid_horizons: int = Field(default=4, alias="AUTO_PREDICTION_MIN_VALID_HORIZONS")
 
     model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")
 

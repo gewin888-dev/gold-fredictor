@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import configured_prediction_sources
+from app.data.utils import gold_price_frame
 from app.models import GoldPrice, GoldScoreSnapshot
 
 
@@ -17,16 +18,6 @@ def _direction_signal(score: float) -> int:
     if score <= -30:
         return -1
     return 0
-
-
-def _gold_price_frame(db: Session) -> pd.DataFrame:
-    """从 GoldPrice 表读取金价日线。"""
-    rows = db.scalars(select(GoldPrice).order_by(GoldPrice.date.asc())).all()
-    if not rows:
-        return pd.DataFrame(columns=["timestamp", "gold_price"])
-    return pd.DataFrame(
-        [{"timestamp": row.date, "gold_price": row.close} for row in rows]
-    ).sort_values("timestamp")
 
 
 def _score_frame(db: Session, score_sources: set[str] | None = None) -> pd.DataFrame:
@@ -63,7 +54,7 @@ def run_score_backtest(
 
     allowed_sources = score_sources or configured_prediction_sources()
     scores = _score_frame(db, allowed_sources)
-    prices = _gold_price_frame(db)
+    prices = gold_price_frame(db)
     if scores.empty or prices.empty:
         return {
             "ok": False,

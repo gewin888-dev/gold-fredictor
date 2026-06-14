@@ -36,6 +36,27 @@ class MacroObservation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
+class ExternalMarketIndicator(Base):
+    """授权/人工维护的外部黄金市场指标。
+
+    用于承接 ETF 持仓与资金流、COMEX 库存/期限结构、期权隐含波动率、
+    地缘风险、印度/中国实物需求等暂不适合直接用免费 API 稳定采集的数据。
+    """
+    __tablename__ = "external_market_indicators"
+    __table_args__ = (UniqueConstraint("indicator_id", "timestamp", name="uq_external_indicator_timestamp"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    indicator_id: Mapped[str] = mapped_column(String(96), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="MANUAL", nullable=False)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class GoldScoreSnapshot(Base):
     __tablename__ = "gold_score_snapshots"
 
@@ -84,6 +105,21 @@ class MacroEvent(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
+class AppSetting(Base):
+    """非密钥运行配置。
+
+    页面只允许写入这些安全开关；API 密钥仍由 .env 管理。
+    """
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_type: Mapped[str] = mapped_column(String(32), default="str", nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="API", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class ScoreParamsVersion(Base):
     """存储评分模型的参数版本，支持自我进化。"""
     __tablename__ = "score_params_versions"
@@ -115,6 +151,21 @@ class PredictionModelVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ModelActivationAudit(Base):
+    """模型/评分版本激活与回滚审计记录。"""
+    __tablename__ = "model_activation_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    model_type: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    from_version: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    to_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    operator: Mapped[str] = mapped_column(String(128), default="dashboard", nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class GoldPredictionSnapshot(Base):

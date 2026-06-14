@@ -128,3 +128,79 @@ def test_upcoming_events_endpoint(db_session):
     payload = response.json()
     assert payload["ok"] is True
     assert len(payload["data"]) >= 1
+
+
+def test_auto_optimize_settings_endpoint_uses_safe_db_settings(db_session):
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        initial = client.get("/settings/auto-optimize")
+        updated = client.post(
+            "/settings/auto-optimize",
+            json={
+                "AUTO_OPTIMIZE_SCORE_PARAMS": True,
+                "AUTO_ACTIVATE_OPTIMIZED_PARAMS": False,
+                "FRED_API_KEY": True,
+            },
+        )
+        after = client.get("/settings/auto-optimize")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert initial.status_code == 200
+    assert initial.json()["ok"] is True
+    assert updated.status_code == 200
+    assert updated.json()["ok"] is True
+    assert "FRED_API_KEY" in updated.json()["rejected_keys"]
+    assert updated.json()["settings"]["AUTO_OPTIMIZE_SCORE_PARAMS"] is True
+    assert after.json()["settings"]["AUTO_OPTIMIZE_SCORE_PARAMS"] is True
+    assert "health" in after.json()
+
+
+def test_score_factor_registry_exposes_scoring_and_gray_status():
+    client = TestClient(app)
+    response = client.get("/score/factors/registry")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    factors = {row["name"]: row for row in payload["data"]}
+    assert factors["ETF资金流"]["scored"] is True
+    assert factors["ETF资金流"]["optimizable"] is True
+    assert factors["COMEX库存"]["scored"] is False
+    assert factors["COMEX库存"]["inactive_reason"]
+    assert factors["地缘风险"]["scored"] is False
+
+
+def test_deactivate_score_params_endpoint_restores_default(db_session):
+    from app.models import ScoreParamsVersion
+
+    db_session.add(
+        ScoreParamsVersion(
+            version="candidate_for_deactivate_test",
+            params_json="{}",
+            hit_rate=0.6,
+            sample_count=130,
+            backtest_horizon_days=20,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.post("/score/params/deactivate")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["version"] == "default"
+    assert db_session.query(ScoreParamsVersion).filter_by(is_active=True).count() == 0

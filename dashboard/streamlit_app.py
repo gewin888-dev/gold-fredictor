@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import html
 import sys
 import time
 import datetime as dt
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy import select
@@ -20,13 +22,16 @@ from app.database import SessionLocal, init_db
 from app.config import get_settings
 from app.backtesting.score_backtest import run_score_backtest
 from app.events.calendar import list_macro_events
-from app.models import CftcPosition, GoldScoreSnapshot, MacroObservation, MacroSeries
+from app.models import CftcPosition, ExternalMarketIndicator, GoldScoreSnapshot, MacroObservation, MacroSeries
 from app.monitoring.health import get_data_health
 from app.scoring.gold_score import compute_and_store_gold_score
+from app.scoring.factor_registry import factor_groups as registry_factor_groups
+from app.scoring.factor_registry import factor_help as registry_factor_help
+from app.scoring.factor_registry import inactive_factor_reasons as registry_inactive_reasons
 
 import httpx
 
-st.set_page_config(page_title="黄金走势监控", layout="wide")
+st.set_page_config(page_title="黄金走势监控", layout="wide", initial_sidebar_state="collapsed")
 SETTINGS = get_settings()
 LOW_CONFIDENCE_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
 
@@ -207,6 +212,72 @@ div[data-testid="stMetricValue"] {
   opacity: 0.48;
   filter: grayscale(0.7);
 }
+.factor-card {
+  position: relative;
+  min-height: 66px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: #ffffff;
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  cursor: help;
+}
+.factor-card:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.10);
+}
+.factor-card::after {
+  content: attr(data-tooltip);
+  display: none;
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: min(320px, 70vw);
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #d7dde6;
+  background: #ffffff;
+  color: #334155;
+  font-size: 0.76rem;
+  line-height: 1.38;
+  font-weight: 500;
+  white-space: normal;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+}
+.factor-card:hover::after {
+  display: block;
+}
+.factor-card-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #64748b;
+  margin-bottom: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.factor-card-value {
+  font-size: 1.02rem;
+  font-weight: 750;
+  color: var(--ink);
+  margin-bottom: 0;
+}
+.factor-card-positive .factor-card-value { color: #047857; }
+.factor-card-negative .factor-card-value { color: #b91c1c; }
+.factor-card-neutral .factor-card-value { color: #64748b; }
+.factor-card-inactive {
+  background: #f8fafc;
+  filter: grayscale(0.7);
+  opacity: 0.72;
+}
+.factor-card-inactive .factor-card-value {
+  color: #94a3b8;
+}
 div[data-testid="stExpander"] {
   background: #ffffff;
   border: 1px solid var(--line);
@@ -344,6 +415,53 @@ def get_shanghai_gold() -> dict:
         return {}
 
 
+@st.cache_data(ttl=300)
+def get_shanghai_daily() -> pd.DataFrame:
+    """获取沪金连续日线K线数据（新浪财经期货）。字段：d=日期 o=开 h=高 l=低 c=收。"""
+    import json
+    import requests as req
+    try:
+        url = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_AU0=/InnerFuturesNewService.getDailyKLine?symbol=AU0"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+        r = req.get(url, headers=headers, timeout=15)
+        text = r.text
+        start = text.find("(") + 1
+        end = text.rfind(")")
+        if start > 0 and end > start:
+            data = json.loads(text[start:end])
+            return pd.DataFrame(data)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=120)
+def get_shanghai_intraday() -> pd.DataFrame:
+    """获取沪金连续日内5分钟K线（新浪财经，仅当日）。"""
+    import json
+    import requests as req
+    try:
+        url = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_AU0=/InnerFuturesNewService.getFewMinLine?symbol=AU0&type=5"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+        r = req.get(url, headers=headers, timeout=15)
+        text = r.text
+        start = text.find("(") + 1
+        end = text.rfind(")")
+        if start > 0 and end > start:
+            data = json.loads(text[start:end])
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df["timestamp"] = pd.to_datetime(df["d"])
+                cutoff = pd.Timestamp.now() - pd.Timedelta(hours=36)
+                df = df[df["timestamp"] >= cutoff]
+                df = df[df["timestamp"] <= pd.Timestamp.now()]
+                df["close"] = df["c"].astype(float)
+                return df.sort_values("timestamp")
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=55)
 def get_scores() -> pd.DataFrame:
     db = SessionLocal()
@@ -367,6 +485,29 @@ def get_macro() -> pd.DataFrame:
         return pd.DataFrame([{
             "时间": r.timestamp, "指标": meta_map.get(r.series_id, r.series_id),
             "值": r.value, "series_id": r.series_id,
+        } for r in rows])
+    finally:
+        db.close()
+
+
+@st.cache_data(ttl=55)
+def get_external_indicators() -> pd.DataFrame:
+    db = SessionLocal()
+    try:
+        rows = db.scalars(
+            select(ExternalMarketIndicator)
+            .order_by(ExternalMarketIndicator.timestamp.desc(), ExternalMarketIndicator.indicator_id.asc())
+            .limit(200)
+        ).all()
+        return pd.DataFrame([{
+            "时间": r.timestamp,
+            "指标ID": r.indicator_id,
+            "指标": r.name,
+            "类别": r.category,
+            "值": r.value,
+            "单位": r.unit,
+            "来源": r.source,
+            "备注": r.note,
         } for r in rows])
     finally:
         db.close()
@@ -433,16 +574,25 @@ def get_premium() -> pd.DataFrame:
         db.close()
 
 
-@st.cache_data(ttl=35)
-def get_intraday() -> dict:
-    """获取日内金价数据，用于24小时走势图"""
+@st.cache_data(ttl=60)
+def get_intraday() -> pd.DataFrame:
+    """获取COMEX日内金价完整时间戳（直接查数据库，保留日期）。"""
+    from datetime import datetime, timedelta, timezone as tz
+    from app.models import IntradaySnapshot
+    db = SessionLocal()
     try:
-        with httpx.Client(timeout=httpx.Timeout(15)) as c:
-            r = c.get("http://localhost:8000/gold/intraday",
-                      params={"interval_minutes": 5})
-            return r.json() if r.status_code == 200 else {}
-    except Exception:
-        return {}
+        cutoff = datetime.now(tz.utc) - timedelta(hours=25)
+        rows = db.scalars(
+            select(IntradaySnapshot)
+            .where(IntradaySnapshot.timestamp >= cutoff)
+            .order_by(IntradaySnapshot.timestamp.asc())
+        ).all()
+        return pd.DataFrame([{
+            "timestamp": r.timestamp,
+            "close": r.price,
+        } for r in rows])
+    finally:
+        db.close()
 
 
 @st.cache_data(ttl=55)
@@ -511,6 +661,47 @@ def _now_beijing():
 def _is_low_confidence_source(source: object) -> bool:
     return str(source or "").upper() in LOW_CONFIDENCE_SOURCES
 
+
+def _finite_chart_frame(df: pd.DataFrame, required_cols: list[str], numeric_cols: list[str]) -> pd.DataFrame:
+    """Return rows that Altair can safely render without infinite extents."""
+    if df.empty:
+        return df.copy()
+    out = df.dropna(subset=required_cols).copy()
+    if "时间" in out.columns:
+        out["时间"] = pd.to_datetime(out["时间"], errors="coerce", utc=True).dt.tz_convert(None)
+        out = out.dropna(subset=["时间"])
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out[np.isfinite(out[col])]
+    return out
+
+
+def _intraday_coverage_label(df: pd.DataFrame) -> tuple[str, list[str]]:
+    if df.empty or "timestamp" not in df.columns:
+        return "暂无日内数据", ["后台尚未记录到可绘制的日内金价快照。"]
+    clean = df.dropna(subset=["timestamp", "close"]).copy()
+    clean["close"] = pd.to_numeric(clean["close"], errors="coerce")
+    clean = clean[np.isfinite(clean["close"])]
+    if clean.empty:
+        return "暂无有效日内数据", ["日内快照存在，但价格字段不可绘制。"]
+    start = pd.to_datetime(clean["timestamp"].min())
+    end = pd.to_datetime(clean["timestamp"].max())
+    coverage_minutes = max(0.0, (end - start).total_seconds() / 60)
+    if coverage_minutes >= 23 * 60:
+        label = "24小时金价走势"
+    elif coverage_minutes >= 60:
+        label = f"近 {coverage_minutes / 60:.1f} 小时金价走势"
+    else:
+        label = f"近 {coverage_minutes:.0f} 分钟金价走势"
+    notes: list[str] = []
+    if coverage_minutes < 60:
+        notes.append("日内快照覆盖不足 1 小时，暂不能代表 24 小时走势。")
+    elif coverage_minutes < 23 * 60:
+        notes.append("日内快照尚未覆盖完整 24 小时，图表按当前可用区间展示。")
+    if clean["close"].nunique() <= 1:
+        notes.append("COMEX 报价在当前快照区间内没有变化，可能处于休市或报价源冻结。")
+    return label, notes
+
 st.markdown(
     """<div class="hero">
       <div class="hero-title">黄金走势实时监控与预测系统</div>
@@ -518,6 +709,69 @@ st.markdown(
     </div>""",
     unsafe_allow_html=True,
 )
+
+# ═══ 侧边栏 ═══
+
+with st.sidebar:
+    st.markdown("### ⚙️ 自动优化")
+    auto_config = api("/settings/auto-optimize")
+    auto_settings = auto_config.get("settings", {})
+    new_score = st.toggle("评分参数自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS", False))
+    new_activate = st.toggle("达标自动激活", value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", False))
+    new_pred = st.toggle("预测模型自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", False))
+    new_pred_activate = st.toggle("预测模型自动激活", value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", False))
+    if st.button("💾 保存", use_container_width=True):
+        r = api("/settings/auto-optimize", "post", json={
+            "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
+            "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
+            "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
+            "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
+        })
+        if r.get("ok"):
+            st.success("已保存")
+            st.rerun()
+    st.divider()
+    saved = st.session_state.get("_auto_saved", auto_settings)
+    st.caption("⚠️ 达标自动激活已开启" if saved.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS") else "仅生成候选，需手动激活")
+
+
+with st.expander("模型健康", expanded=False):
+    health_payload = auto_config.get("health", {}) if isinstance(auto_config, dict) else {}
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("评分参数版本", health_payload.get("score_params_version", "default"))
+    h2.metric("预测模型版本", health_payload.get("prediction_model_version") or "—")
+    h3.metric("已评估预测", health_payload.get("prediction_evaluated_count", 0))
+    h4.metric("到期未评估", health_payload.get("prediction_due_pending_count", 0))
+
+    h5, h6, h7, h8 = st.columns(4)
+    h5.metric("评分样本条件", "满足" if health_payload.get("score_sample_ready") else "不足")
+    h6.metric("预测样本条件", "满足" if health_payload.get("prediction_sample_ready") else "不足")
+    h7.metric("自动搜索", "开" if (
+        auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS") or auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL")
+    ) else "关")
+    h8.metric("自动激活", "开" if (
+        auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS") or auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")
+    ) else "关")
+
+    latest_score_candidate = health_payload.get("latest_score_candidate") or {}
+    latest_prediction_candidate = health_payload.get("latest_prediction_candidate") or {}
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.caption(
+            "最近评分候选："
+            f"{latest_score_candidate.get('version', '—')} · "
+            f"命中率 {latest_score_candidate.get('hit_rate', '—')} · "
+            f"样本 {latest_score_candidate.get('sample_count', '—')}"
+        )
+    with c_right:
+        st.caption(
+            "最近预测候选："
+            f"{latest_prediction_candidate.get('version', '—')} · "
+            f"方向准确率 {latest_prediction_candidate.get('direction_accuracy', '—')} · "
+            f"MAPE {latest_prediction_candidate.get('mape_price_pct', '—')}"
+        )
+    for reason in health_payload.get("reasons", []):
+        st.caption(f"• {reason}")
 
 # ═══════════════════════════════════════════
 # 时间条 + 金价卡片
@@ -645,53 +899,126 @@ if gold.get("ok") and gold.get("price"):
         rows = db.scalars(select(GP).order_by(GP.date.desc()).limit(range_days)).all()
         if rows:
             df = pd.DataFrame([{"日期": r.date, "收盘": r.close} for r in reversed(rows)])
+            # ── 沪金日线 ──
+            sh_daily = get_shanghai_daily()
+            sh_line = None
+            if not sh_daily.empty:
+                sh_daily["日期"] = pd.to_datetime(sh_daily["d"])
+                sh_daily["收盘_cny"] = sh_daily["c"].astype(float)
+                start_d = df["日期"].min()
+                sh_line = sh_daily[(sh_daily["日期"] >= start_d - pd.Timedelta(days=2)) & (sh_daily["日期"] <= df["日期"].max() + pd.Timedelta(days=2))]
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=df["日期"], y=df["收盘"], mode="lines+markers",
+                name="COMEX",
                 line=dict(color="#f0b90b", width=1.5), marker=dict(size=3),
-                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra></extra>",
+                hovertemplate="%{x|%Y-%m-%d}<br>COMEX $%{y:,.0f}<extra></extra>",
             ))
+            # 沪金第二trace
+            sh_trace = None
+            if sh_line is not None and not sh_line.empty:
+                sh_trace = go.Scatter(
+                    x=sh_line["日期"], y=sh_line["收盘_cny"], mode="lines+markers",
+                    name="沪金",
+                    line=dict(color="#dc2626", width=1.2), marker=dict(size=2),
+                    yaxis="y2",
+                    hovertemplate="%{x|%Y-%m-%d}<br>沪金 ¥%{y:,.1f}/g<extra></extra>",
+                )
+                fig.add_trace(sh_trace)
+            # 右上角图例标注
+            fig.add_annotation(
+                x=0.005, y=0.98, xref="paper", yref="paper", xanchor="left", yanchor="top",
+                text="<span style='color:#c9972b'>● COMEX</span>  <span style='color:#dc2626'>● 沪金</span>",
+                showarrow=False, font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+            )
             fig.update_layout(
                 **PLOTLY_LIGHT_LAYOUT,
-                height=200, margin=dict(l=0,r=0,t=0,b=30),
+                height=300, margin=dict(l=0,r=0,t=0,b=30),
                 xaxis=dict(tickformat="%m/%d", tickangle=-45, showgrid=False),
                 yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
-                hovermode="x unified",
+                yaxis2=dict(
+                    title=None, overlaying="y", side="right",
+                    showgrid=False, color="#dc2626",
+                ),
+                hovermode="x unified", showlegend=False
             )
             st.plotly_chart(fig, use_container_width=True)
             latest_daily = pd.to_datetime(df["日期"].iloc[-1]).strftime("%Y-%m-%d %H:%M:%S")
-            st.caption(f"历史金价曲线为新浪日线数据，最新日线时间：{latest_daily}；实时报价见上方 COMEX 金价卡片（新浪财经 hf_GC）。")
+            st.caption(f"金价日线：COMEX（黄） + 沪金连续（红，¥/g）。最新日线：{latest_daily}。COMEX 实时报价见上方卡片。")
     finally:
         db.close()
 
     # 24 小时金价走势趋势图
-    intraday = get_intraday()
-    if intraday.get("ok") and intraday.get("points"):
+    comex_raw = get_intraday()
+    if not comex_raw.empty:
+        coverage_label, intraday_notes = _intraday_coverage_label(comex_raw)
         st.divider()
         col_i1, col_i2 = st.columns([4, 1])
         with col_i1:
-            st.caption("24小时金价走势")
+            st.caption(coverage_label)
         with col_i2:
             st.markdown(f'<span class="live-dot"></span> <span style="color:#94a3b8;font-size:0.72rem;">实时监控中 · {time.strftime("%H:%M:%S")}</span>', unsafe_allow_html=True)
-        pts = intraday["points"]
-        idf = pd.DataFrame(pts)
-        idf["timestamp"] = pd.to_datetime(idf["time"], format="%H:%M")
+
+        # COMEX: resample 1-min raw to 5-min OHLC
+        comex_raw["timestamp"] = pd.to_datetime(comex_raw["timestamp"], errors="coerce")
+        comex_raw["close"] = pd.to_numeric(comex_raw["close"], errors="coerce")
+        comex_raw = comex_raw.dropna(subset=["timestamp", "close"])
+        comex_raw = comex_raw.set_index("timestamp").sort_index()
+        comex_5m = comex_raw.resample("5min").agg({"close": "last"}).dropna()
+        idf = comex_5m.reset_index().rename(columns={"index": "timestamp"})
+
+        # Shanghai: keep original Sina timestamps (now with full date)
+        sh_intra = get_shanghai_intraday()
+        sh_price_text = ""
 
         fig_i = go.Figure()
-        fig_i.add_trace(go.Scatter(
-            x=idf["timestamp"], y=idf["close"], mode="lines+markers",
-            line=dict(color="#f0b90b", width=1.5), marker=dict(size=2),
-            hovertemplate="%{x|%H:%M}<br>$%{y:,.2f}<extra></extra>",
-        ))
+        if not idf.empty:
+            # ── COMEX 金价（黄色） ──
+            fig_i.add_trace(go.Scatter(
+                x=idf["timestamp"], y=idf["close"], mode="lines+markers",
+                name="COMEX",
+                line=dict(color="#f0b90b", width=1.5), marker=dict(size=2),
+                hovertemplate="%{x|%m/%d %H:%M}<br>COMEX $%{y:,.2f}<extra></extra>",
+            ))
+        # ── 沪金日内（红色） ──
+        if not sh_intra.empty:
+            sh_price_text = f"沪金 ¥{sh_intra['close'].iloc[-1]:,.1f}/g · "
+            fig_i.add_trace(go.Scatter(
+                x=sh_intra["timestamp"], y=sh_intra["close"], mode="lines+markers",
+                name="沪金",
+                line=dict(color="#dc2626", width=1.2), marker=dict(size=2),
+                yaxis="y2",
+                hovertemplate="%{x|%m/%d %H:%M}<br>沪金 ¥%{y:,.1f}/g<extra></extra>",
+            ))
+        else:
+            _sh = get_shanghai_gold()
+            if _sh.get("ok"):
+                sh_price_text = f"沪金 ¥{_sh['price']:,.1f}/g · "
+        # 右上角图例标注
+        fig_i.add_annotation(
+            x=0.005, y=0.98, xref="paper", yref="paper", xanchor="left", yanchor="top",
+            text="<span style='color:#c9972b'>● COMEX</span>  <span style='color:#dc2626'>● 沪金</span>",
+            showarrow=False, font=dict(size=11),
+            bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+        )
         fig_i.update_layout(
             **PLOTLY_LIGHT_LAYOUT,
-            height=200, margin=dict(l=0,r=0,t=0,b=20),
-            xaxis=dict(tickformat="%H:%M", showgrid=False, range=[idf["timestamp"].min(), idf["timestamp"].max() + pd.Timedelta(minutes=30)]),
+            height=300, margin=dict(l=0,r=0,t=0,b=20),
+            xaxis=dict(tickformat="%m/%d %H:%M", showgrid=False),
             yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
-            hovermode="x unified",
+            yaxis2=dict(
+                title=None, overlaying="y", side="right",
+                showgrid=False, color="#dc2626",
+            ),
+            hovermode="x unified", showlegend=False
         )
         st.plotly_chart(fig_i, use_container_width=True)
-        st.caption(f"24小时日内金价走势（{intraday.get('interval_minutes', 5)}分钟聚合，来源：新浪财经，每60秒本地快照记录）")
+        caption_parts = [f"{coverage_label} · {sh_price_text}5分钟聚合，来源：新浪财经"]
+        caption_parts.extend(note.rstrip("。") for note in intraday_notes)
+        st.caption("；".join(caption_parts) + "。")
+    else:
+        st.caption("日内金价快照不足，后台记录器启动并采集到数据后会显示走势。")
 else:
     st.warning("实时金价暂时无法获取。")
 
@@ -728,46 +1055,91 @@ else:
     s1, s2, s3, s4 = st.columns(4)
     score_val = latest["评分"]
     direction_icon = "🟢" if score_val >= 30 else ("🔴" if score_val <= -30 else "🟡")
-    s1.metric("综合评分", f"{direction_icon} {score_val:+.1f}")
+    # 综合评分突出显示
+    score_color = "#047857" if score_val >= 30 else ("#b91c1c" if score_val <= -30 else "#b45309")
+    score_bg = "#f0fdf4" if score_val >= 30 else ("#fef2f2" if score_val <= -30 else "#fffbeb")
+    dir_label = "偏多" if score_val >= 30 else ("偏空" if score_val <= -30 else "中性")
+    s1.markdown(
+        f'<div style="text-align:center;padding:12px 8px;border-radius:8px;'
+        f'background:{score_bg};border:2px solid {score_color};min-width:120px">'
+        f'<div style="font-size:0.72rem;color:#64748b;margin-bottom:2px">综合评分 · {dir_label}</div>'
+        f'<div style="font-size:1.55rem;font-weight:800;color:{score_color}">{direction_icon} {score_val:+.1f}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     bull = sum(v for v in factors.values() if v > 0)
     bear = sum(abs(v) for v in factors.values() if v < 0)
-    s2.metric("利多因子合计", f"+{bull:.0f}分")
-    s3.metric("利空因子合计", f"-{bear:.0f}分")
-    s4.metric("因子总数", len(factors))
+    net = bull - bear
+    s2.metric("因子总数", len(factors))
+    s3.metric("利多合计", f"+{bull:.0f}分")
+    s4.metric("利空合计", f"-{bear:.0f}分")
+    # ── 评分参考说明 ──
+    st.markdown(
+        '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 14px;margin:4px 0 8px 0">'
+        '<span style="font-size:0.78rem;color:#64748b">📖 '
+        '<b>评分解读</b>：+30 以上偏多，−30 以下偏空，中间为中性。'
+        f'当前评分基于 {len(factors)} 项已入库因子（利率、美元、流动性、持仓、情绪、央行等）加权计算，'
+        '正分=利多黄金，负分=利空黄金。仅供参考，不构成投资建议。</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-    # ── 20 因子卡片固定在评分下方 ──
-    # 因子说明映射
-    factor_help = {
-        "实际利率": "TIPS 实际利率↑ → 持有黄金机会成本↑ → 利空",
-        "名义利率": "10Y 美债收益率↑ → 债券更吸引 → 黄金利空",
-        "联邦基金": "联邦基金利率↑ → 紧缩 → 利空黄金",
-        "美元指数": "美元走强 → 黄金对非美买家变贵 → 利空",
-        "避险情绪": "VIX↑ → 恐慌情绪↑ → 避险买金 → 利多",
-        "通胀预期": "通胀预期↑ → 保值需求↑ → 利多黄金",
-        "黄金趋势": "价格在 MA20/MA60 上方=多头趋势 → 利多；下方=空头 → 利空",
-        "短期动量": "近 3 日金价涨跌幅，涨=利多、跌=利空",
-        "美股分流": "标普 500↑ → 资金流股市 → 黄金利空",
-        "白银/黄金比": "比值升=风险偏好↑ → 利空黄金；比值降=避险 → 利多",
-        "GLD ETF": "ETF 价格涨 → 资金流入黄金 → 利多",
-        "美元人民币": "人民币贬值 → 沪金溢价↑ → 利多黄金",
-        "搜索热度": "Google 搜索量飙升 → 散户 FOMO → 短期见顶 → 利空",
-        "矿业股GDX": "金矿股涨 → 领先金价 → 利多黄金",
-        "原油WTI": "油价涨 → 通胀预期↑ → 利多黄金",
-        "铜/金比": "铜强金弱=risk-on → 利空；铜弱金强=避险 → 利多",
-        "CFTC投机仓位": "非商业净多占比高 → 投机看多 → 利多；过度拥挤可能反转",
-        "央行购金": "全球央行净购金 → 长期需求支撑 → 利多",
-        "新闻情绪": "黄金新闻偏正面 → 市场情绪乐观 → 利多；偏负面 → 避险 → 利多",
-        "中国溢价": "溢价高 → 中国需求旺盛 → 利多；贴水 → 需求疲软 → 利空",
-    }
-    sorted_factors = sorted(factors.items(), key=lambda x: x[1], reverse=True)
-    per_row = 10
-    for i in range(0, len(sorted_factors), per_row):
-        row_items = sorted_factors[i:i + per_row]
-        cols = st.columns(len(row_items))
-        for j, (name, val) in enumerate(row_items):
-            icon = "🟢" if val > 0 else ("🔴" if val < 0 else "⚪")
-            help_text = factor_help.get(name, "")
-            cols[j].metric(name, f"{icon} {val:+.1f}", help=help_text)
+    factor_help = registry_factor_help()
+    factor_groups = registry_factor_groups()
+    inactive_factor_reasons = registry_inactive_reasons()
+
+    def render_factor_card(column, name: str, value: float | None, tooltip: str) -> None:
+        safe_name = html.escape(name)
+        safe_tooltip = html.escape(tooltip or "暂无说明。", quote=True)
+        if value is None:
+            class_name = "factor-card factor-card-inactive"
+            value_text = "未评分"
+        else:
+            icon = "🟢" if value > 0 else ("🔴" if value < 0 else "⚪")
+            class_name = "factor-card factor-card-positive" if value > 0 else (
+                "factor-card factor-card-negative" if value < 0 else "factor-card factor-card-neutral"
+            )
+            value_text = f"{icon} {value:+.1f}"
+        column.markdown(
+            f"""
+            <div class="{class_name}" data-tooltip="{safe_tooltip}">
+              <div class="factor-card-title">{safe_name}</div>
+              <div class="factor-card-value">{html.escape(value_text)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    shown: set[str] = set()
+    for group_name, names in factor_groups.items():
+        group_items = [(name, factors.get(name)) for name in names if name in factors or name in inactive_factor_reasons]
+        if not group_items:
+            continue
+        st.markdown(f'<div class="section-label">{group_name}</div>', unsafe_allow_html=True)
+        per_row = 10
+        for i in range(0, len(group_items), per_row):
+            row_items = group_items[i:i + per_row]
+            cols = st.columns(len(row_items))
+            for j, (name, val) in enumerate(row_items):
+                if val is None:
+                    reason = inactive_factor_reasons.get(name, "暂无可信数据入库；后续可接入数据源或手动录入。")
+                    render_factor_card(cols[j], name, None, reason)
+                else:
+                    render_factor_card(cols[j], name, val, factor_help.get(name, ""))
+                    shown.add(name)
+
+    other_factors = sorted(
+        [(name, val) for name, val in factors.items() if name not in shown],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    if other_factors:
+        st.markdown('<div class="section-label">其他已入库因子</div>', unsafe_allow_html=True)
+        for i in range(0, len(other_factors), 10):
+            row_items = other_factors[i:i + 10]
+            cols = st.columns(len(row_items))
+            for j, (name, val) in enumerate(row_items):
+                render_factor_card(cols[j], name, val, factor_help.get(name, ""))
 
     # 计算详情
     if factor_details:
@@ -803,7 +1175,7 @@ else:
     default_end = chart_scores.index[-1]
     fig_s.update_layout(
         **PLOTLY_LIGHT_LAYOUT,
-        height=180, margin=dict(l=0,r=0,t=0,b=20),
+        height=280, margin=dict(l=0,r=0,t=0,b=20),
         yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
         hovermode="x unified", showlegend=False,
         xaxis=dict(showgrid=False, rangeslider=dict(visible=False),
@@ -836,14 +1208,20 @@ else:
 st.divider()
 st.subheader("金价预测")
 
-@st.cache_data(ttl=120)
-def get_prediction() -> dict:
+@st.cache_data(ttl=90)
+def get_prediction() -> tuple[dict, str]:
+    """返回 (data_dict, error_msg)。error_msg 为空时表示成功。"""
     try:
-        with httpx.Client(timeout=httpx.Timeout(30)) as c:
+        with httpx.Client(timeout=httpx.Timeout(45)) as c:
             r = c.get("http://localhost:8000/predict/gold")
-            return r.json() if r.status_code == 200 else {}
-    except Exception:
-        return {}
+            if r.status_code != 200:
+                return {}, f"API 返回状态 {r.status_code}"
+            data = r.json()
+            if not data.get("ok"):
+                return data, data.get("reason", "未知错误")
+            return data, ""
+    except Exception as e:
+        return {}, f"连接后端失败：{e}"
 
 
 @st.cache_data(ttl=60)
@@ -855,25 +1233,63 @@ def get_prediction_evaluation() -> dict:
 def get_prediction_models() -> dict:
     return api("/predict/models")
 
-pred = get_prediction()
+
+@st.cache_data(ttl=45)
+def get_prediction_due_status() -> dict:
+    return api("/predict/due-status")
+
+pred, pred_error = get_prediction()
 if pred.get("ok"):
     current = pred.get("current_price")
+    due_status = get_prediction_due_status()
+    evaluated_count = int(due_status.get("evaluated_count") or 0)
+    due_pending_count = int(due_status.get("due_pending_count") or 0)
+    future_pending_count = int(due_status.get("future_pending_count") or 0)
     st.caption(
         f"v2 多信号集成：模型 {pred.get('model_version', '—')}，训练源 {', '.join(pred.get('training_sources', []))}。"
         "短期动量+评分回归，长期宏观基准+调整。仅供参考，不构成投资建议。"
     )
+    st.caption(
+        f"预测闭环状态：已评估 {evaluated_count} 条，到期待评估 {due_pending_count} 条，"
+        f"待到期 {future_pending_count} 条。{due_status.get('message', '')}"
+    )
 
-    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 4])
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1.2, 3.8])
     with ctrl1:
-        if st.button("保存预测快照", use_container_width=True):
+        if st.button("保存本次预测", use_container_width=True):
             api("/predict/gold/snapshot", "post")
             st.cache_data.clear()
             st.rerun()
     with ctrl2:
-        if st.button("评估到期预测", use_container_width=True):
+        if st.button(f"补评估到期预测({due_pending_count})", use_container_width=True):
             api("/predict/evaluate", "post")
             st.cache_data.clear()
             st.rerun()
+    with ctrl3:
+        candidate_help = "评估样本少于 120 条，不建议生成候选模型。" if evaluated_count < 120 else "样本条件基本满足，可生成候选模型。"
+        st.caption(candidate_help)
+        if st.button("生成候选模型", use_container_width=True):
+            r = api("/predict/models/optimize", "post", params={"n_iter": 40, "top_k": 5, "save_best": True})
+            st.session_state["prediction_optimize_result"] = r
+            st.cache_data.clear()
+            st.rerun()
+    opt_result = st.session_state.get("prediction_optimize_result")
+    if opt_result:
+        if opt_result.get("ok"):
+            best = opt_result.get("best") or {}
+            activation = opt_result.get("activation") or {}
+            mode = "已自动激活" if activation.get("activated") else "等待人工激活"
+            st.success(
+                f"已生成候选模型 {opt_result.get('saved_version')}："
+                f"综合分 {best.get('optimization_score')}，"
+                f"MAPE {best.get('weighted_mape_price_pct')}%，"
+                f"方向准确率 {best.get('weighted_direction_accuracy')}。"
+                f"{mode}。"
+            )
+            if activation.get("reasons"):
+                st.caption("自动激活判断：" + "；".join(activation.get("reasons", [])))
+        else:
+            st.warning(f"候选模型生成失败：{opt_result.get('reason', '未知原因')}")
 
     preds = pred.get("predictions", [])
     if preds:
@@ -984,10 +1400,10 @@ if pred.get("ok"):
         ))
         fig_p.update_layout(
             **PLOTLY_LIGHT_LAYOUT,
-            height=200, margin=dict(l=0,r=0,t=0,b=20),
+            height=300, margin=dict(l=0,r=0,t=0,b=20),
             xaxis=dict(showgrid=False),
             yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
-            hovermode="x unified",
+            hovermode="x unified", showlegend=False
         )
         st.plotly_chart(fig_p, use_container_width=True)
 
@@ -1052,8 +1468,18 @@ if pred.get("ok"):
                 ]
                 existing_cols = [c for c in show_cols if c in mdf.columns]
                 st.dataframe(mdf[existing_cols], use_container_width=True, hide_index=True)
+                st.caption("候选模型默认不自动激活。确认表现后，可调用 API：POST /predict/models/{version}/activate。")
 else:
-    st.caption("暂无预测数据（需要足够的评分历史）。")
+    if pred_error:
+        st.warning(f"预测数据加载失败：{pred_error}")
+        if st.button("重试加载预测", key="retry_pred"):
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        st.caption(
+            "暂无预测数据（需要足够的评分历史或已配置的同版本评分源）。"
+            " 请确认已采集 FRED/CFTC 等核心数据并至少执行过一次评分计算。"
+        )
 
 # ═══════════════════════════════════════════
 # 宏观指标
@@ -1064,18 +1490,92 @@ st.subheader("宏观指标")
 
 macro = get_macro()
 if not macro.empty:
-    import altair as alt
+    import plotly.express as px
     series_ids = macro["series_id"].unique()
-    selected = st.multiselect("选择指标", series_ids, default=list(series_ids[:4]))
+    preferred_series = [
+        "DFII5", "DFII10", "DFII30", "THREEFYTP10",
+        "WALCL", "WDTGAL", "RRPONTSYD", "WRESBAL",
+        "GFDEGDQ188S", "FYFSD",
+    ]
+    default_series = [sid for sid in preferred_series if sid in series_ids][:5] or list(series_ids[:4])
+    selected = st.multiselect("选择指标", series_ids, default=default_series)
     if selected:
-        mdf = macro[macro["series_id"].isin(selected)]
-        macro_chart = alt.Chart(mdf).mark_line(strokeWidth=1.5).encode(
-            x=alt.X("时间:T", title=None),
-            y=alt.Y("值:Q", title=None),
-            color=alt.Color("指标:N", legend=alt.Legend(orient="top")),
-            tooltip=["指标", "时间", "值"],
-        ).properties(height=200).configure_view(strokeWidth=0)
-        st.altair_chart(macro_chart, use_container_width=True)
+        mdf = _finite_chart_frame(
+            macro[macro["series_id"].isin(selected)],
+            required_cols=["时间", "值"],
+            numeric_cols=["值"],
+        )
+        if not mdf.empty:
+            macro_chart = px.line(mdf, x="时间", y="值", color="指标")
+            macro_chart.update_layout(
+                **PLOTLY_LIGHT_LAYOUT,
+                height=220,
+                margin=dict(l=0, r=0, t=8, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                yaxis_title=None,
+                xaxis_title=None,
+            )
+            st.plotly_chart(macro_chart, use_container_width=True)
+        else:
+            st.caption("所选宏观指标暂无可绘制数值。")
+
+external_df = get_external_indicators()
+if not external_df.empty:
+    with st.expander("ETF / COMEX / 期权 / 地缘 / 实物需求外部指标"):
+        st.dataframe(external_df, use_container_width=True, hide_index=True)
+
+with st.expander("手动录入外部指标", expanded=False):
+    catalog_payload = api("/external/indicators/catalog")
+    catalog_rows = catalog_payload.get("data", []) if catalog_payload.get("ok") else []
+    manual_candidates = [
+        row for row in catalog_rows
+        if row.get("indicator_id") in {
+            "COMEX_REGISTERED_GOLD_OZ",
+            "COMEX_GOLD_FRONT_SPREAD_PCT",
+            "GEO_RISK_INTENSITY",
+            "INDIA_CHINA_PHYSICAL_DEMAND",
+            "GLD_FLOW_TONNES",
+            "GOLD_OPTION_IV_30D",
+            "GOLD_OPTION_SKEW_25D",
+        }
+    ]
+    if manual_candidates:
+        labels = [f"{row.get('name')} ({row.get('indicator_id')})" for row in manual_candidates]
+        selected_label = st.selectbox("指标", labels, key="manual_indicator_select")
+        selected_meta = manual_candidates[labels.index(selected_label)]
+        m1, m2, m3 = st.columns([1, 1, 1])
+        with m1:
+            manual_value = st.number_input(f"数值（{selected_meta.get('unit') or ''}）", value=0.0, key="manual_indicator_value")
+        with m2:
+            manual_date = st.date_input("日期", value=_now_beijing().date(), key="manual_indicator_date")
+        with m3:
+            manual_source = st.text_input("来源", value="MANUAL", key="manual_indicator_source")
+        manual_note = st.text_input("备注", value=str(selected_meta.get("reason") or ""), key="manual_indicator_note")
+        st.caption(str(selected_meta.get("reason") or ""))
+        if st.button("保存外部指标", use_container_width=True):
+            ts = dt.datetime.combine(manual_date, dt.time.min, tzinfo=UTC_TZ).isoformat()
+            result = api(
+                "/external/indicators",
+                "post",
+                json={
+                    "indicator_id": selected_meta.get("indicator_id"),
+                    "timestamp": ts,
+                    "value": manual_value,
+                    "source": manual_source or "MANUAL",
+                    "name": selected_meta.get("name"),
+                    "category": selected_meta.get("category"),
+                    "unit": selected_meta.get("unit"),
+                    "note": manual_note,
+                },
+            )
+            if result.get("ok"):
+                st.success("已保存外部指标")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(result.get("reason", "保存失败"))
+    else:
+        st.caption("暂无可手动录入的外部指标目录。")
 
 # ═══════════════════════════════════════════
 # CFTC
@@ -1085,18 +1585,34 @@ st.divider()
 st.subheader("CFTC 黄金期货持仓")
 cftc = get_cftc()
 if not cftc.empty:
-    import altair as alt
+    import plotly.express as px
     cftc_melt = cftc.melt(id_vars=["时间"], value_vars=["多", "空", "净多"],
                           var_name="类型", value_name="合约数")
-    # 数据少时显示点，数据多时只显示线
-    show_pts = len(cftc) <= 5
-    cftc_chart = alt.Chart(cftc_melt).mark_line(point=show_pts).encode(
-        x=alt.X("时间:T", title=None),
-        y=alt.Y("合约数:Q", title="合约数"),
-        color=alt.Color("类型:N", scale=alt.Scale(range=["#10b981", "#ef4444", "#6366f1"])),
-        tooltip=["时间:T", "类型:N", alt.Tooltip("合约数:Q", format=",")],
-    ).properties(height=180).configure_view(strokeWidth=0)
-    st.altair_chart(cftc_chart, use_container_width=True)
+    cftc_melt = _finite_chart_frame(
+        cftc_melt,
+        required_cols=["时间", "合约数"],
+        numeric_cols=["合约数"],
+    )
+    if not cftc_melt.empty:
+        cftc_chart = px.line(
+            cftc_melt,
+            x="时间",
+            y="合约数",
+            color="类型",
+            color_discrete_map={"多": "#10b981", "空": "#ef4444", "净多": "#6366f1"},
+            markers=len(cftc) <= 5,
+        )
+        cftc_chart.update_layout(
+            **PLOTLY_LIGHT_LAYOUT,
+            height=200,
+            margin=dict(l=0, r=0, t=8, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            yaxis_title="合约数",
+            xaxis_title=None,
+        )
+        st.plotly_chart(cftc_chart, use_container_width=True)
+    else:
+        st.caption("CFTC 数据暂无可绘制合约数。")
 else:
     st.caption("暂无 CFTC 数据。")
 
@@ -1115,13 +1631,26 @@ if (
 ):
     st.caption("央行购金数据来源：WGC/IMF IFS，基于季度报告按月估算。")
 elif not global_cb.empty:
-    import altair as alt
-    cb_chart = alt.Chart(global_cb).mark_bar(color="#c9972b").encode(
-        x=alt.X("月份:N", title=None),
-        y=alt.Y("净购金(吨):Q", title="吨"),
-        tooltip=["月份", "净购金(吨)", "来源"],
-    ).properties(height=160).configure_view(strokeWidth=0)
-    st.altair_chart(cb_chart, use_container_width=True)
+    import plotly.express as px
+    cb_plot = _finite_chart_frame(
+        global_cb,
+        required_cols=["月份", "净购金(吨)"],
+        numeric_cols=["净购金(吨)"],
+    )
+    if not cb_plot.empty:
+        cb_chart = px.bar(cb_plot, x="月份", y="净购金(吨)", hover_data=["来源"])
+        cb_chart.update_traces(marker_color="#c9972b")
+        cb_chart.update_layout(
+            **PLOTLY_LIGHT_LAYOUT,
+            height=190,
+            margin=dict(l=0, r=0, t=8, b=20),
+            yaxis_title="吨",
+            xaxis_title=None,
+            showlegend=False,
+        )
+        st.plotly_chart(cb_chart, use_container_width=True)
+    else:
+        st.caption("央行购金暂无可绘制数值。")
 else:
     st.caption("央行购金可验证来源待接入。")
 
@@ -1167,7 +1696,7 @@ if sent_score is not None:
             height=140, margin=dict(l=0,r=0,t=0,b=20),
             xaxis=dict(tickformat="%H:%M", dtick=600000, showgrid=False),
             yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
-            hovermode="x unified",
+            hovermode="x unified", showlegend=False
         )
         st.plotly_chart(fig_sent, use_container_width=True)
 
@@ -1208,49 +1737,133 @@ with st.expander("评分模型自我进化", expanded=False):
 
     col_opt1, col_opt2, col_opt3 = st.columns([2, 1, 1])
     with col_opt1:
-        n_iter = st.slider("搜索迭代次数", 50, 500, 200, 50, key="opt_n_iter")
+        n_iter = st.slider("搜索迭代次数", 20, 200, 50, 10, key="opt_n_iter")
     with col_opt2:
         horizon_days = st.selectbox("回测展望期（天）", [10, 20, 30, 60], index=1, key="opt_horizon")
     with col_opt3:
         do_opt = st.button("🚀 开始优化", use_container_width=True, type="primary")
 
     if do_opt:
-        with st.spinner(f"随机搜索 {n_iter} 次，评估 {horizon_days} 天命中率..."):
-            r = api("/score/optimize", "post", params={"n_iter": n_iter, "horizon_days": horizon_days})
+        with st.spinner(f"随机搜索 {n_iter} 次，评估 {horizon_days} 天命中率（约需 {n_iter*5//60} 分钟）..."):
+            import httpx
+            try:
+                resp = httpx.post(
+                    "http://localhost:8000/score/optimize",
+                    params={"n_iter": n_iter, "horizon_days": horizon_days},
+                    timeout=httpx.Timeout(600),
+                )
+                r = resp.json() if resp.status_code == 200 else {}
+            except Exception:
+                r = {}
         if r.get("ok"):
-            st.success(f"优化完成！命中率 {r.get('hit_rate', 0)*100:.1f}% → {r.get('best_hit_rate', 0)*100:.1f}%")
-            st.metric("最优命中率", f"{r.get('best_hit_rate', 0)*100:.1f}%",
-                      delta=f"{r.get('improvement', 0):+.1f}% vs 默认")
-            if r.get("best_params"):
-                with st.expander("最优参数", expanded=False):
-                    st.json(r["best_params"])
+            best = r.get("best", {})
+            baseline = r.get("baseline") or {}
+            best_hr = best.get("hit_rate")
+            base_hr = baseline.get("hit_rate")
+            st.success(f"优化完成！版本 {r.get('version', '?')}")
+            c1, c2 = st.columns(2)
+            c1.metric("最优命中率", f"{best_hr*100:.1f}%" if best_hr else "—")
+            c2.metric("默认命中率", f"{base_hr*100:.1f}%" if base_hr else "—")
         else:
             st.error(r.get("reason", "优化失败"))
 
     # 显示历史版本
     @st.cache_data(ttl=120)
     def get_param_versions() -> pd.DataFrame:
-        db = SessionLocal()
-        try:
-            from app.models import ScoreParamsVersion
-            rows = db.scalars(
-                select(ScoreParamsVersion).order_by(ScoreParamsVersion.created_at.desc())
-            ).all()
-            return pd.DataFrame([{
-                "版本": r.version,
-                "命中率": f"{r.hit_rate*100:.1f}%" if r.hit_rate else "—",
-                "样本数": r.sample_count or "—",
-                "激活": "✅" if r.is_active else "",
-                "创建时间": r.created_at.strftime("%m-%d %H:%M") if r.created_at else "",
-                "备注": r.notes or "",
-            } for r in rows])
-        finally:
-            db.close()
+        payload = api("/score/params")
+        rows = payload.get("data", []) if payload.get("ok") else []
+        return pd.DataFrame([{
+            "版本": r.get("version"),
+            "命中率": f"{r.get('hit_rate')*100:.1f}%" if r.get("hit_rate") else "—",
+            "样本数": r.get("sample_count") or "—",
+            "激活": "✅" if r.get("is_active") else "",
+            "创建时间": str(r.get("created_at") or "")[:16].replace("T", " "),
+            "备注": r.get("notes") or "",
+        } for r in rows])
+
+    @st.cache_data(ttl=300)
+    def get_param_compare(version: str) -> dict:
+        return api(f"/score/params/{version}/compare")
 
     versions = get_param_versions()
     if not versions.empty:
         st.caption("参数版本历史")
         st.dataframe(versions, use_container_width=True, hide_index=True)
+
+        # 激活/回滚
+        col_a1, col_a2, col_a3 = st.columns([2, 1, 1])
+        with col_a1:
+            active_ver = st.selectbox("选择版本", versions["版本"].tolist(), key="activate_ver")
+        with col_a2:
+            if st.button("✅ 激活", use_container_width=True):
+                rr = api(
+                    f"/score/params/{active_ver}/activate",
+                    "post",
+                    json={"operator": "dashboard", "reason": "人工审核后在仪表盘激活"},
+                )
+                if rr.get("ok"):
+                    st.success(f"已激活 {active_ver}")
+                    risk = rr.get("overfit_risk") or {}
+                    if risk.get("not_recommended_for_direct_activation"):
+                        st.warning("该版本存在过拟合风险：" + "；".join(risk.get("warnings", [])))
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(rr.get("reason", "失败"))
+        with col_a3:
+            if st.button("🔄 恢复默认", use_container_width=True):
+                rr = api(
+                    "/score/params/deactivate",
+                    "post",
+                    json={"operator": "dashboard", "reason": "人工恢复默认评分规则"},
+                )
+                if rr.get("ok"):
+                    st.success("已恢复默认规则 v2")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(rr.get("reason", "失败"))
+
+        compare = get_param_compare(active_ver)
+        if compare.get("ok"):
+            detail = compare.get("data", {})
+            candidate = detail.get("candidate") or {}
+            baseline = detail.get("baseline") or {}
+            risk = detail.get("overfit_risk", {})
+            st.markdown("#### 候选对比详情")
+            metric_rows = [
+                ("保存命中率", None, candidate.get("stored_hit_rate")),
+                ("命中率", baseline.get("hit_rate"), candidate.get("hit_rate")),
+                ("信号覆盖率", baseline.get("signal_ratio"), candidate.get("signal_ratio")),
+                ("方向样本数", baseline.get("signal_count"), candidate.get("signal_count")),
+                ("多头样本", baseline.get("long_signal_count"), candidate.get("long_signal_count")),
+                ("空头样本", baseline.get("short_signal_count"), candidate.get("short_signal_count")),
+                ("尾部收益", baseline.get("worst_decile_return"), candidate.get("worst_decile_return")),
+                ("近期窗口命中率", baseline.get("recent_hit_rate"), candidate.get("recent_hit_rate")),
+                ("相对baseline提升", 0, candidate.get("baseline_lift")),
+            ]
+            st.dataframe(
+                pd.DataFrame([
+                    {"指标": name, "baseline": base, "candidate": cand}
+                    for name, base, cand in metric_rows
+                ]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if risk.get("level") == "high":
+                st.warning("过拟合风险高：" + "；".join(risk.get("warnings", [])))
+            elif risk.get("level") == "medium":
+                st.info("过拟合风险提示：" + "；".join(risk.get("warnings", [])))
+            else:
+                st.caption("过拟合检查：" + "；".join(risk.get("warnings", [])))
+            st.caption(detail.get("recommendation", ""))
+
+        audits = api("/models/activation-audit", params={"limit": 20})
+        if audits.get("ok") and audits.get("data"):
+            with st.expander("激活审计记录", expanded=False):
+                audit_df = pd.DataFrame(audits["data"])
+                show_cols = ["created_at", "model_type", "action", "from_version", "to_version", "operator", "reason"]
+                st.dataframe(audit_df[[c for c in show_cols if c in audit_df.columns]], use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════
 # 底部状态

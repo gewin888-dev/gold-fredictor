@@ -5,9 +5,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logger = logging.getLogger(__name__)
 
 from app.config import get_settings
+from app.auto_settings import resolved_auto_settings
 from app.data.cb_gold_collector import collect_central_bank_gold
 from app.data.cftc_collector import collect_cftc_gold_position
 from app.data.fred_collector import collect_fred_data
+from app.data.market_structure_collector import collect_market_structure_data
 from app.data.sentiment_collector import collect_news_sentiment
 from app.data.sge_collector import collect_china_gold_premium
 from app.database import SessionLocal, serialized_write
@@ -16,7 +18,7 @@ from app.monitoring.health import get_data_health
 from app.monitoring.threshold_alert import send_threshold_alerts
 from app.notifications.feishu import send_score_alert_with_health
 from app.scoring.gold_score import compute_and_store_gold_score, compute_and_store_gold_score_with_params
-from app.scoring.gold_predictor import evaluate_due_predictions, predict_gold_prices
+from app.scoring.gold_predictor import evaluate_due_predictions, optimize_prediction_model_params, predict_gold_prices
 from app.scoring.score_optimizer import activate_version, get_active_params, optimize_score_params, save_best_params
 
 
@@ -148,6 +150,7 @@ def collect_and_score_job() -> None:
                 ("中国溢价", collect_china_gold_premium),
                 ("央行购金", collect_central_bank_gold),
                 ("新闻情绪", collect_news_sentiment),
+                ("市场结构", collect_market_structure_data),
                 ("SP500", _collect_sp500_snapshot),
                 ("白银", _collect_silver_snapshot),
                 ("GLD_ETF", _collect_gld_snapshot),
@@ -172,6 +175,13 @@ def collect_and_score_job() -> None:
             predict_gold_prices(db, persist=True)
             evaluate_due_predictions(db)
 
+            # 自动进化桥接：预测不准 → 搜索更优参数
+            try:
+                from app.auto_evolve import auto_evolve_if_needed
+                auto_evolve_if_needed(db)
+            except Exception:
+                logger.debug("自动进化检查跳过", exc_info=True)
+
         # 阈值告警（因子突变即时推送）
         send_threshold_alerts(db, snapshot)
 
@@ -195,42 +205,64 @@ def collect_and_score_job() -> None:
 
 
 def auto_optimize_job() -> None:
-    """受控自我优化：保存候选参数；默认不自动激活。"""
-    settings = get_settings()
-    if not settings.auto_optimize_score_params:
-        return
-
+    """受控自我优化：保存候选评分/预测参数；默认不自动激活。"""
     db = SessionLocal()
     try:
-        with serialized_write():
-            results = optimize_score_params(
-                db,
-                n_iter=settings.auto_optimize_n_iter,
-                horizon_days=settings.auto_optimize_horizon_days,
-            )
-            if not results or not results[0].get("ok"):
-                return
+        settings = resolved_auto_settings(db)
+        if not settings["AUTO_OPTIMIZE_SCORE_PARAMS"] and not settings["AUTO_OPTIMIZE_PREDICTION_MODEL"]:
+            return
 
-            best = results[0]
-            from datetime import datetime, timezone
+        if settings["AUTO_OPTIMIZE_SCORE_PARAMS"]:
+            with serialized_write():
+                results = optimize_score_params(
+                    db,
+                    n_iter=int(settings["AUTO_OPTIMIZE_N_ITER"]),
+                    horizon_days=int(settings["AUTO_OPTIMIZE_HORIZON_DAYS"]),
+                )
+                if not results or not results[0].get("ok"):
+                    results = []
 
-            version = f"auto_opt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
-            saved = save_best_params(
-                db,
-                best,
-                version=version,
-                horizon_days=settings.auto_optimize_horizon_days,
-                notes="定时任务生成的候选参数；默认仅保存，达到阈值且显式授权后才自动激活。",
-            )
-            hit_rate = best.get("hit_rate")
-            if (
-                settings.auto_activate_optimized_params
-                and hit_rate is not None
-                and float(hit_rate) >= settings.auto_optimize_min_hit_rate
-                and saved.sample_count
-                and saved.sample_count >= 80
-            ):
-                activate_version(db, version)
+                if results:
+                    best = results[0]
+                    from datetime import datetime, timezone
+
+                    version = f"auto_opt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+                    saved = save_best_params(
+                        db,
+                        best,
+                        version=version,
+                        horizon_days=int(settings["AUTO_OPTIMIZE_HORIZON_DAYS"]),
+                        notes="定时任务生成的候选评分参数；默认仅保存，达到阈值且显式授权后才自动激活。",
+                    )
+                    hit_rate = best.get("hit_rate")
+                    activation_check = best.get("activation_check") or {}
+                    if (
+                        settings["AUTO_ACTIVATE_OPTIMIZED_PARAMS"]
+                        and hit_rate is not None
+                        and float(hit_rate) >= float(settings["AUTO_OPTIMIZE_MIN_HIT_RATE"])
+                        and saved.sample_count
+                        and saved.sample_count >= 120
+                        and activation_check.get("eligible")
+                    ):
+                        activate_version(db, version)
+
+        if settings["AUTO_OPTIMIZE_PREDICTION_MODEL"]:
+            with serialized_write():
+                optimize_prediction_model_params(
+                    db,
+                    n_iter=int(settings["AUTO_PREDICTION_N_ITER"]),
+                    top_k=5,
+                    random_seed=42,
+                    save_best=True,
+                    auto_activate=bool(settings["AUTO_ACTIVATE_PREDICTION_MODEL"]),
+                    activation_thresholds={
+                        "min_score": settings["AUTO_PREDICTION_MIN_SCORE"],
+                        "max_mape_price_pct": settings["AUTO_PREDICTION_MAX_MAPE_PCT"],
+                        "min_direction_accuracy": settings["AUTO_PREDICTION_MIN_DIRECTION_ACCURACY"],
+                        "min_samples": settings["AUTO_PREDICTION_MIN_SAMPLES"],
+                        "min_valid_horizons": settings["AUTO_PREDICTION_MIN_VALID_HORIZONS"],
+                    },
+                )
     finally:
         db.close()
 

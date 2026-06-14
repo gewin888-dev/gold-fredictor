@@ -23,11 +23,13 @@ from app.models import (
     CentralBankGold,
     CftcPosition,
     ChinaGoldPremium,
+    ExternalMarketIndicator,
     GoldPrice,
     GoldScoreSnapshot,
     MacroObservation,
     NewsSentiment,
 )
+from app.scoring.factor_registry import is_scored_factor
 
 from typing import TYPE_CHECKING
 
@@ -38,11 +40,21 @@ if TYPE_CHECKING:
 # ── FRED 序列 ID ──────────────────────────────────────────────────
 
 REAL_RATE = "DFII10"
+REAL_RATE_5Y = "DFII5"
+REAL_RATE_30Y = "DFII30"
 NOMINAL_RATE = "DGS10"
 INFLATION_EXPECTATION = "T10YIE"
 FED_RATE = "FEDFUNDS"
 VIX = "VIXCLS"
 DOLLAR = "DTWEXBGS"                 # 美元广义贸易加权指数
+GOLD_VOLATILITY = "GVZCLS"          # CBOE Gold ETF Volatility Index
+TERM_PREMIUM_10Y = "THREEFYTP10"    # 10年期美债期限溢价
+FED_BALANCE_SHEET = "WALCL"         # 美联储总资产
+TREASURY_GENERAL_ACCOUNT = "WDTGAL" # 美国财政部一般账户
+OVERNIGHT_RRP = "RRPONTSYD"         # 隔夜逆回购
+BANK_RESERVES = "WRESBAL"           # 准备金余额
+FEDERAL_DEFICIT = "FYFSD"           # 联邦财政盈余/赤字
+DEBT_TO_GDP = "GFDEGDQ188S"         # 联邦债务/GDP
 SP500 = "SP500"                      # 标普 500（美股分流效应）
 SILVER = "SILVER"                    # 白银价格（新浪 hf_SI）
 GLD_ETF = "GLD_ETF"                  # SPDR Gold Trust ETF 价格
@@ -53,10 +65,23 @@ COPPER = "COPPER"                    # 铜价
 
 REQUIRED_FRED_SERIES = [REAL_RATE, NOMINAL_RATE, INFLATION_EXPECTATION, VIX, DOLLAR]
 # 可选指标（不阻塞评分）
-BONUS_FRED_SERIES = [SP500, SILVER, GLD_ETF, GOOGLE_TREND, GDX, WTI, COPPER]
-TRUSTED_SCORING_SOURCES = {"FRED", "YAHOO", "CFTC", "GDELT", "WGC", "IMF", "SGE", "SINA", "LBMA", "TEST", "NEWSAPI", "GOOGLE_TRENDS"}
-# 中国溢价必须来自官方/授权口径；SINA 只能作为展示估算，不纳入评分。
-PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST"}
+BONUS_FRED_SERIES = [
+    SP500, SILVER, GLD_ETF, GOOGLE_TREND, GDX, WTI, COPPER,
+    GOLD_VOLATILITY, REAL_RATE_5Y, REAL_RATE_30Y, TERM_PREMIUM_10Y, FED_BALANCE_SHEET,
+    TREASURY_GENERAL_ACCOUNT, OVERNIGHT_RRP, BANK_RESERVES, FEDERAL_DEFICIT,
+    DEBT_TO_GDP,
+]
+TRUSTED_SCORING_SOURCES = {"FRED", "YAHOO", "CFTC", "GDELT", "WGC", "IMF", "SGE", "SINA", "LBMA", "TEST", "NEWSAPI", "GOOGLE_TRENDS", "SPDR", "CME", "CBOE"}
+# 中国溢价可信评分源
+PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST", "SINA"}
+
+
+def _filter_registry_scored_factors(factor_scores: dict[str, float]) -> dict[str, float]:
+    return {
+        name: score
+        for name, score in factor_scores.items()
+        if is_scored_factor(name)
+    }
 
 
 @dataclass(frozen=True)
@@ -173,18 +198,23 @@ HORIZON_GROUPS: dict[str, tuple[float, tuple[str, ...]]] = {
     "中期宏观": (
         0.40,
         (
-            "实际利率",
             "名义利率",
             "联邦基金",
             "美元指数",
-            "通胀预期",
+            "通胀预期",   # 通胀预期主归属 → 中期
             "CFTC投机仓位",
             "美股分流",
             "铜/金比",
             "原油WTI",
-            "美元人民币",
-            "新闻情绪",
+            "美元人民币",  # 汇率主归属 → 中期
             "中国溢价",
+            "实际利率曲线",
+            "期限溢价",
+            "美元流动性",
+            "财政压力",
+            "COMEX库存",
+            "COMEX期限结构",
+            "期权隐波偏度",
         ),
     ),
     "长期结构": (
@@ -192,9 +222,10 @@ HORIZON_GROUPS: dict[str, tuple[float, tuple[str, ...]]] = {
         (
             "央行购金",
             "实际利率",
-            "通胀预期",
-            "CFTC投机仓位",
-            "美元人民币",
+            "ETF资金流",
+            "地缘风险",
+            "实物需求",
+            # 通胀预期/CFTC/汇率/新闻情绪主归属全部移至对应较短周期分组
         ),
     ),
 }
@@ -372,6 +403,177 @@ def _sentiment_score(db: Session) -> tuple[float | None, str | None]:
     score = round(_clamp(float(result) * 1.5, -10, 10), 2)
     note = f"近 7 日黄金新闻情绪均值为 {float(result):.2f}。"
     return score, note
+
+
+def _latest_external_indicator(db: Session, indicator_id: str) -> ExternalMarketIndicator | None:
+    return db.scalar(
+        select(ExternalMarketIndicator)
+        .where(ExternalMarketIndicator.indicator_id == indicator_id)
+        .order_by(ExternalMarketIndicator.timestamp.desc())
+    )
+
+
+def _series_pct_change(merged: pd.DataFrame, column: str, periods: int = 20) -> float | None:
+    clean = merged[[column]].dropna()
+    if len(clean) <= periods:
+        return None
+    base = float(clean[column].iloc[-1 - periods])
+    if base == 0:
+        return None
+    return (float(clean[column].iloc[-1]) / base - 1) * 100
+
+
+def _external_indicator_signal(
+    db: Session,
+    indicator_id: str,
+    factor_name: str,
+    scale: float,
+    clamp_lo: float,
+    clamp_hi: float,
+    max_age_days: int,
+) -> tuple[float | None, str | None, float | None]:
+    row = _latest_external_indicator(db, indicator_id)
+    if not row:
+        return None, None, None
+    if not _is_trusted_scoring_source(row.source):
+        return None, _skip_factor_note(factor_name, row.source, "不是可信评分源"), None
+    age = _age_days(row.timestamp)
+    if _source_key(row.source) != "TEST" and age is not None and age > max_age_days:
+        return None, _skip_factor_note(factor_name, row.source, f"已过期 {age:.0f} 天"), None
+    score = round(_clamp(row.value * scale, clamp_lo, clamp_hi), 2)
+    note = f"{factor_name}最新值为 {row.value:.2f}{row.unit or ''}。"
+    return score, note, row.value
+
+
+def _add_second_stage_factor_scores(
+    db: Session,
+    merged: pd.DataFrame,
+    factor_scores: dict[str, float],
+    details: dict[str, dict[str, float]],
+    risk_flags: list[str],
+    params: "ScoreParams | None" = None,
+) -> None:
+    """补充第二阶段因子：曲线、期限溢价、流动性、财政、外部授权指标。"""
+
+    real_curve_cols = [col for col in (REAL_RATE_5Y, REAL_RATE, REAL_RATE_30Y) if col in merged.columns]
+    if len(real_curve_cols) >= 2:
+        curve_changes = [
+            change for col in real_curve_cols
+            if (change := _multi_window_change(merged, col)) is not None
+        ]
+        if curve_changes:
+            avg_change = sum(curve_changes) / len(curve_changes)
+            slope_score = 0.0
+            if REAL_RATE_5Y in merged.columns and REAL_RATE_30Y in merged.columns:
+                clean = merged[[REAL_RATE_5Y, REAL_RATE_30Y]].dropna()
+                if len(clean) > 20:
+                    latest_slope = float(clean[REAL_RATE_30Y].iloc[-1] - clean[REAL_RATE_5Y].iloc[-1])
+                    old_slope = float(clean[REAL_RATE_30Y].iloc[-21] - clean[REAL_RATE_5Y].iloc[-21])
+                    slope_score = (latest_slope - old_slope) * 8
+                    details["实际利率曲线"] = {
+                        "平均变化": round(avg_change, 4),
+                        "30Y-5Y变化": round(latest_slope - old_slope, 4),
+                    }
+            coef = getattr(params, "real_curve_coef", 28.0)
+            lo = getattr(params, "real_curve_clamp_low", -20.0)
+            hi = getattr(params, "real_curve_clamp_high", 20.0)
+            factor_scores["实际利率曲线"] = round(_clamp(-avg_change * coef + slope_score, lo, hi), 2)
+
+    if TERM_PREMIUM_10Y in merged.columns:
+        premium_change = _multi_window_change(merged, TERM_PREMIUM_10Y)
+        if premium_change is not None:
+            coef = getattr(params, "term_premium_coef", 18.0)
+            lo = getattr(params, "term_premium_clamp_low", -12.0)
+            hi = getattr(params, "term_premium_clamp_high", 12.0)
+            factor_scores["期限溢价"] = round(_clamp(premium_change * coef, lo, hi), 2)
+            details["期限溢价"] = {
+                "当前": round(float(merged[TERM_PREMIUM_10Y].dropna().iloc[-1]), 3),
+                "多窗口变化": round(premium_change, 4),
+            }
+            if float(merged[TERM_PREMIUM_10Y].dropna().iloc[-1]) >= 1.0:
+                risk_flags.append("10年期美债期限溢价处于较高区域，财政和期限风险补偿可能抬升。")
+
+    liquidity_parts: list[float] = []
+    liquidity_detail: dict[str, float] = {}
+    for col, weight, label in [
+        (FED_BALANCE_SHEET, 0.7, "Fed资产负债表20日变化%"),
+        (BANK_RESERVES, 0.5, "准备金20日变化%"),
+        (TREASURY_GENERAL_ACCOUNT, -0.35, "TGA20日变化%"),
+        (OVERNIGHT_RRP, -0.25, "RRP20日变化%"),
+    ]:
+        if col in merged.columns:
+            pct = _series_pct_change(merged, col, 20)
+            if pct is not None:
+                liquidity_parts.append(pct * weight)
+                liquidity_detail[label] = round(pct, 2)
+    if liquidity_parts:
+        liquidity_signal = sum(liquidity_parts)
+        coef = getattr(params, "liquidity_coef", 1.0)
+        lo = getattr(params, "liquidity_clamp_low", -12.0)
+        hi = getattr(params, "liquidity_clamp_high", 12.0)
+        factor_scores["美元流动性"] = round(_clamp(liquidity_signal * coef, lo, hi), 2)
+        details["美元流动性"] = liquidity_detail
+
+    fiscal_parts: list[float] = []
+    fiscal_detail: dict[str, float] = {}
+    if DEBT_TO_GDP in merged.columns:
+        debt_rows = len(merged.dropna(subset=[DEBT_TO_GDP]))
+        if debt_rows > 1:
+            debt_change = _latest_change(merged, DEBT_TO_GDP, min(60, debt_rows - 1))
+            if debt_change is not None:
+                fiscal_parts.append(debt_change * 1.2)
+                fiscal_detail["债务/GDP变化"] = round(debt_change, 2)
+    if FEDERAL_DEFICIT in merged.columns:
+        deficit_rows = len(merged.dropna(subset=[FEDERAL_DEFICIT]))
+        if deficit_rows > 1:
+            deficit_change = _latest_change(merged, FEDERAL_DEFICIT, min(252, deficit_rows - 1))
+            if deficit_change is not None:
+                fiscal_parts.append(-deficit_change / 200000)
+                fiscal_detail["财政盈余/赤字变化"] = round(deficit_change, 0)
+    if fiscal_parts:
+        coef = getattr(params, "fiscal_coef", 1.0)
+        lo = getattr(params, "fiscal_clamp_low", -10.0)
+        hi = getattr(params, "fiscal_clamp_high", 10.0)
+        factor_scores["财政压力"] = round(_clamp(sum(fiscal_parts) * coef, lo, hi), 2)
+        details["财政压力"] = fiscal_detail
+
+    if GOLD_VOLATILITY in merged.columns:
+        gvz_clean = merged[[GOLD_VOLATILITY]].dropna()
+        if len(gvz_clean) > 20:
+            gvz_now = float(gvz_clean[GOLD_VOLATILITY].iloc[-1])
+            gvz_ma20 = float(gvz_clean[GOLD_VOLATILITY].tail(20).mean())
+            gvz_change = float(gvz_clean[GOLD_VOLATILITY].iloc[-1] - gvz_clean[GOLD_VOLATILITY].iloc[-21])
+            coef = getattr(params, "option_vol_coef", 1.0)
+            lo = getattr(params, "option_vol_clamp_low", -8.0)
+            hi = getattr(params, "option_vol_clamp_high", 8.0)
+            score = ((gvz_now - gvz_ma20) * 0.25 + gvz_change * 0.35) * coef
+            factor_scores["期权隐波偏度"] = round(_clamp(score, lo, hi), 2)
+            details["期权隐波偏度"] = {
+                "GVZ当前": round(gvz_now, 2),
+                "GVZ20日均值": round(gvz_ma20, 2),
+                "GVZ20日变化": round(gvz_change, 2),
+            }
+
+    external_specs = [
+        ("GLD_FLOW_TONNES", "ETF资金流", 0.35, -12, 12, 15),
+        ("COMEX_REGISTERED_GOLD_OZ", "COMEX库存", 0.0000005, -8, 8, 10),
+        ("COMEX_GOLD_FRONT_SPREAD_PCT", "COMEX期限结构", 3.0, -8, 8, 10),
+        ("GOLD_OPTION_IV_30D", "期权隐波偏度", 0.12, -8, 8, 5),
+        ("GOLD_OPTION_SKEW_25D", "期权隐波偏度", 0.8, -8, 8, 5),
+        ("GEO_RISK_INTENSITY", "地缘风险", 1.2, -10, 10, 7),
+        ("INDIA_CHINA_PHYSICAL_DEMAND", "实物需求", 1.0, -10, 10, 31),
+    ]
+    for indicator_id, factor_name, scale, lo, hi, max_age in external_specs:
+        if indicator_id == "GLD_FLOW_TONNES":
+            scale = getattr(params, "etf_flow_coef", scale)
+            lo = getattr(params, "etf_flow_clamp_low", lo)
+            hi = getattr(params, "etf_flow_clamp_high", hi)
+        score, note, value = _external_indicator_signal(db, indicator_id, factor_name, scale, lo, hi, max_age)
+        if score is not None and is_scored_factor(factor_name):
+            factor_scores[factor_name] = round(factor_scores.get(factor_name, 0.0) + score, 2)
+            details.setdefault(factor_name, {})[indicator_id] = round(value or 0.0, 4)
+        if note:
+            risk_flags.append(note)
 
 
 # ── 核心评分函数 ──────────────────────────────────────────────────
@@ -553,7 +755,7 @@ def compute_gold_score(db: Session) -> ScoreResult:
             details["矿业股GDX"] = {"价格": round(float(gdx_clean[GDX].iloc[-1]), 2),
                                     f"{n}日变化": round(gdx_chg, 2)}
 
-    # 18. 原油（油价涨→通胀预期↑→利多）
+    # 18. 原油（油价涨→保值需求利多；加息路径由利率因子覆盖）
     if WTI in merged.columns:
         wti_clean = merged[[WTI]].dropna()
         if len(wti_clean) >= 2:
@@ -577,6 +779,9 @@ def compute_gold_score(db: Session) -> ScoreResult:
             ratio_change = (latest_ratio / old_ratio - 1) * 100
             factor_scores["铜/金比"] = round(_clamp(-ratio_change * 1.5, -5, 5), 2)
             details["铜/金比"] = {"比值": round(latest_ratio, 4), f"{n}日变化%": round(ratio_change, 2)}
+
+    # 20. 第二阶段宏观/授权指标：实际利率曲线、期限溢价、美元流动性、财政压力和预留外部指标。
+    _add_second_stage_factor_scores(db, merged, factor_scores, details, risk_flags)
 
     # 8. CFTC 投机仓位（P2-1: 衰减）
     cftc_score, cftc_note = _cftc_position_score(db)
@@ -615,6 +820,8 @@ def compute_gold_score(db: Session) -> ScoreResult:
     if not risk_flags:
         risk_flags.append("当前未触发显著宏观风险阈值。")
 
+    factor_scores = _filter_registry_scored_factors(factor_scores)
+    factor_scores = _filter_registry_scored_factors(factor_scores)
     raw_factor_scores = dict(factor_scores)
     factor_scores, horizon_details = _aggregate_multi_horizon(raw_factor_scores)
     details["多周期评分"] = {
@@ -785,6 +992,9 @@ def compute_gold_score_with_params(db: Session, params: "ScoreParams") -> ScoreR
         factor_scores["新闻情绪"] = sent_score
     if sent_note:
         risk_flags.append(sent_note)
+
+    # 第二阶段宏观/授权指标也参与优化参数评分路径；参数优化仍控制核心老因子权重。
+    _add_second_stage_factor_scores(db, merged, factor_scores, details, risk_flags, params)
 
     # 风险汇总
     if latest[REAL_RATE] >= 2.0:
