@@ -1332,16 +1332,16 @@ def ai_chat_endpoint(req: ChatRequest, db: Session = Depends(get_db)) -> dict[st
 
 
 @app.post("/ai/chat/reset")
-def ai_chat_reset(session_id: str = "default") -> dict[str, object]:
+def ai_chat_reset(session_id: str = "default", db: Session = Depends(get_db)) -> dict[str, object]:
     """重置对话会话，清空历史。"""
-    ai_reset_session(session_id)
+    ai_reset_session(db, session_id)
     return {"ok": True, "session_id": session_id, "message": "会话已重置"}
 
 
 @app.get("/ai/chat/history")
-def ai_chat_history(session_id: str = "default") -> dict[str, object]:
+def ai_chat_history(session_id: str = "default", db: Session = Depends(get_db)) -> dict[str, object]:
     """获取对话历史。"""
-    history = ai_get_history(session_id)
+    history = ai_get_history(db, session_id)
     return {"ok": True, "session_id": session_id, "messages": history}
 
 
