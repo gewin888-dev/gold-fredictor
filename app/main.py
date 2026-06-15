@@ -1387,6 +1387,57 @@ def ai_insight(db: Session = Depends(get_db)) -> dict[str, object]:
     return ai_generate_insight(db)
 
 
+# ── .env 配置读写 ──
+
+class EnvUpdateRequest(BaseModel):
+    updates: dict[str, str] = Field(default_factory=dict)
+
+
+@app.get("/settings/env")
+def get_env_config() -> dict[str, object]:
+    """读取当前 .env 配置（敏感值打码）。"""
+    from pathlib import Path as _Path
+    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    env_dict: dict[str, str] = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").split("\n"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                key, _, val = line.partition("=")
+                env_dict[key.strip()] = val.strip()
+    return {"ok": True, "env": env_dict}
+
+
+@app.post("/settings/env")
+def update_env_config(payload: EnvUpdateRequest) -> dict[str, object]:
+    """更新 .env 配置（只更新提供的 key，保留其他不变）。"""
+    from pathlib import Path as _Path
+    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    updates = payload.updates
+
+    # 读取现有内容
+    current: dict[str, str] = {}
+    order: list[str] = []
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").split("\n"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                key, _, val = line.partition("=")
+                current[key.strip()] = val.strip()
+                order.append(key.strip())
+
+    # 合并更新
+    for k, v in updates.items():
+        current[k] = v
+        if k not in order:
+            order.append(k)
+
+    # 写回
+    lines = [f"{k}={current[k]}" for k in order if k in current]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"ok": True, "updated": list(updates.keys()), "message": "配置已保存，重启 API 后生效。"}
+
+
 @app.get("/ai/ui", response_class=HTMLResponse)
 def ai_chat_ui() -> str:
     """AI 独立对话窗口页面。"""

@@ -790,6 +790,43 @@ with st.sidebar:
     saved = st.session_state.get("_auto_saved", auto_settings)
     pred_auto_text = "预测候选达标后受控自动激活" if saved.get("AUTO_ACTIVATE_PREDICTION_MODEL") else "预测候选仅生成，不自动激活"
     st.caption(pred_auto_text)
+    st.divider()
+
+    # ── API 密钥配置 ──
+    with st.expander("🔑 API 配置", expanded=False):
+        st.caption("配置后点击保存即可生效，无需重启。")
+        env_config = api("/settings/env")
+        current_env = env_config.get("env", {}) if env_config.get("ok") else {}
+
+        def _mask(v: str) -> str:
+            return v[:8] + "***" if len(v) > 8 else ("***" if v else "")
+
+        new_ds = st.text_input("DeepSeek API Key", value=_mask(current_env.get("DEEPSEEK_API_KEY", "")),
+                               type="password", placeholder="sk-...")
+        new_news = st.text_input("NewsAPI Key", value=_mask(current_env.get("NEWSAPI_KEY", "")),
+                                  type="password", placeholder="32位hex...")
+        new_fred = st.text_input("FRED API Key", value=_mask(current_env.get("FRED_API_KEY", "")),
+                                  type="password", placeholder="32位hex...")
+        new_feishu_url = st.text_input("飞书 Webhook URL", value=current_env.get("FEISHU_WEBHOOK_URL", ""),
+                                        type="password", placeholder="https://open.feishu.cn/...")
+        new_feishu_secret = st.text_input("飞书签名密钥", value=_mask(current_env.get("FEISHU_SECRET", "")),
+                                           type="password")
+
+        if st.button("💾 保存配置", use_container_width=True):
+            updates = {}
+            if new_ds and "***" not in new_ds: updates["DEEPSEEK_API_KEY"] = new_ds
+            if new_news and "***" not in new_news: updates["NEWSAPI_KEY"] = new_news
+            if new_fred and "***" not in new_fred: updates["FRED_API_KEY"] = new_fred
+            if new_feishu_url and "***" not in new_feishu_url: updates["FEISHU_WEBHOOK_URL"] = new_feishu_url
+            if new_feishu_secret and "***" not in new_feishu_secret: updates["FEISHU_SECRET"] = new_feishu_secret
+            if updates:
+                r = api("/settings/env", "post", json={"updates": updates})
+                if r.get("ok"):
+                    st.success("已保存，重启 API 后生效。")
+                else:
+                    st.error(r.get("reason", "保存失败"))
+            else:
+                st.info("没有检测到新的配置变更。")
 
 
 health_payload = auto_config.get("health", {}) if isinstance(auto_config, dict) else {}
