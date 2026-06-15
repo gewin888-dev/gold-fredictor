@@ -48,7 +48,7 @@ _alerted: set[str] = set()
 
 
 def _load_state() -> None:
-    """从数据库恢复上次的健康状态。"""
+    """从数据库恢复上次的健康状态，合并到内存中。"""
     try:
         from app.database import SessionLocal
         from app.models import AppSetting
@@ -60,18 +60,23 @@ def _load_state() -> None:
             if row and row.value:
                 data = _json.loads(row.value)
                 for k, v in data.items():
-                    last_success = v.get("last_success")
-                    _collector_state[k] = {
-                        "last_success": last_success,
-                        "last_success_dt": datetime.fromisoformat(last_success) if last_success else None,
-                        "consecutive_failures": v.get("consecutive_failures", 0),
-                        "last_error": v.get("last_error"),
-                        "last_detail": v.get("last_detail"),
-                    }
+                    if k not in _collector_state:  # 不覆盖内存中已有的更新数据
+                        last_success = v.get("last_success")
+                        _collector_state[k] = {
+                            "last_success": last_success,
+                            "last_success_dt": datetime.fromisoformat(last_success) if last_success else None,
+                            "consecutive_failures": v.get("consecutive_failures", 0),
+                            "last_error": v.get("last_error"),
+                            "last_detail": v.get("last_detail"),
+                        }
         finally:
             db.close()
     except Exception:
         pass
+
+
+# 模块加载时自动恢复状态
+_load_state()
 
 
 def record_success(name: str, detail: str = "") -> None:
@@ -110,6 +115,9 @@ def _persist_state() -> None:
             stmt = sqlite_insert(AppSetting).values(
                 key="collector_health_state",
                 value=_json.dumps(data, ensure_ascii=False),
+                value_type="json",
+                description="Collector health tracking state",
+                source="system",
                 updated_at=datetime.now(timezone.utc),
             )
             stmt = stmt.on_conflict_do_update(
@@ -164,9 +172,6 @@ def _try_alert(name: str, consecutive: int, error: str) -> None:
 
 def get_health_summary() -> dict[str, Any]:
     """返回所有采集器的健康状态摘要。"""
-    # 首次调用或重启后，从 DB 恢复状态
-    if not _collector_state:
-        _load_state()
     now = datetime.now(timezone.utc)
     collectors_status = []
 
