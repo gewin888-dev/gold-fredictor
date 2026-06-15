@@ -5,8 +5,11 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
+from sqlalchemy import select
+
 from app.config import get_settings
 from app.auto_settings import resolved_auto_settings
+from app.monitoring.collector_health import record_success, record_failure
 from app.data.cb_gold_collector import collect_central_bank_gold
 from app.data.cftc_collector import collect_cftc_gold_position
 from app.data.fred_collector import collect_fred_data
@@ -150,31 +153,37 @@ def collect_and_score_job() -> None:
     # 先刷新金价日线（独立 DB 会话，失败不阻塞后续采集）
     try:
         fetch_gold_history(days=1)
+        record_success("gold_price", "hourly refresh")
     except Exception:
         logger.warning("金价日线刷新失败（已跳过，不中断整体流程）", exc_info=True)
+        record_failure("gold_price", "fetch_gold_history failed")
 
     db = SessionLocal()
     try:
         # 采集全部数据源（每个独立 try，单点失败不影响其他）
-        for name, collector in [
-            ("FRED", collect_fred_data),
-            ("CFTC", collect_cftc_gold_position),
-            ("中国溢价", collect_china_gold_premium),
-            ("央行购金", collect_central_bank_gold),
-            ("新闻情绪", collect_news_sentiment),
-            ("市场结构", collect_market_structure_data),
-            ("SP500", _collect_sp500_snapshot),
-            ("白银", _collect_silver_snapshot),
-            ("GLD_ETF", _collect_gld_snapshot),
-            ("搜索热度", _collect_google_trend_snapshot),
-            ("GDX", _collect_gdx_snapshot),
-            ("WTI", _collect_wti_snapshot),
-            ("铜", _collect_copper_snapshot),
-        ]:
+        # (显示名, 健康名, 采集函数)
+        _collectors: list[tuple[str, str, object]] = [
+            ("FRED", "fred_data", collect_fred_data),
+            ("CFTC", "cftc_position", collect_cftc_gold_position),
+            ("中国溢价", "china_premium", collect_china_gold_premium),
+            ("央行购金", "central_bank_gold", collect_central_bank_gold),
+            ("新闻情绪", "news_sentiment", collect_news_sentiment),
+            ("市场结构", "market_structure", collect_market_structure_data),
+            ("SP500", "sp500_snapshot", _collect_sp500_snapshot),
+            ("白银", "silver_snapshot", _collect_silver_snapshot),
+            ("GLD_ETF", "gld_etf", _collect_gld_snapshot),
+            ("搜索热度", "google_trend", _collect_google_trend_snapshot),
+            ("GDX", "gdx_snapshot", _collect_gdx_snapshot),
+            ("WTI", "wti_snapshot", _collect_wti_snapshot),
+            ("铜", "copper_snapshot", _collect_copper_snapshot),
+        ]
+        for label, health_name, collector in _collectors:
             try:
                 collector(db)
+                record_success(health_name, "ok")
             except Exception:
-                logger.warning("采集器 %s 失败（已跳过，不中断整体流程）", name, exc_info=True)
+                logger.warning("采集器 %s 失败（已跳过，不中断整体流程）", label, exc_info=True)
+                record_failure(health_name, f"collector {label} failed")
 
         # 所有采集器完成后统一提交，写入操作受串行锁保护
         with serialized_write():
@@ -191,6 +200,40 @@ def collect_and_score_job() -> None:
         predict_gold_prices(db, persist=True)
         evaluate_due_predictions(db)
         rollback_degraded_prediction_model(db)
+
+        # 安全网：如果激活模型方向准确率接近0且存在更好的候选，自动切换
+        try:
+            from app.models import PredictionModelVersion
+            from app.scoring.gold_predictor import _active_prediction_model, activate_prediction_model_version
+            active_model = _active_prediction_model(db)
+            if active_model is not None and (active_model.direction_accuracy or 0.0) < 0.05 \
+                    and (active_model.evaluated_count or 0) >= 5:
+                # 查找更好的候选
+                candidates = db.scalars(
+                    select(PredictionModelVersion)
+                    .where(
+                        PredictionModelVersion.is_active == False,  # noqa: E712
+                        PredictionModelVersion.direction_accuracy > 0.2,
+                        PredictionModelVersion.evaluated_count >= 10,
+                    )
+                    .order_by(PredictionModelVersion.direction_accuracy.desc())
+                ).all()
+                if candidates:
+                    best = candidates[0]
+                    logger.warning(
+                        "安全网触发：激活模型 %s 方向准确率 %.1f%%，自动切换到 %s (%.1f%%)",
+                        active_model.version,
+                        (active_model.direction_accuracy or 0) * 100,
+                        best.version,
+                        (best.direction_accuracy or 0) * 100,
+                    )
+                    activate_prediction_model_version(db, best.version)
+                    record_failure("prediction_engine",
+                                   f"安全网切换: {active_model.version}({active_model.direction_accuracy}) -> {best.version}({best.direction_accuracy})")
+            else:
+                record_success("prediction_engine", f"model={active_model.version}" if active_model else "no_model")
+        except Exception:
+            logger.debug("预测模型安全网检查跳过", exc_info=True)
 
         # 自动进化桥接：预测不准 → 搜索更优参数
         try:

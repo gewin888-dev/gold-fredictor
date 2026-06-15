@@ -4,9 +4,12 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from pathlib import Path
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -57,6 +60,7 @@ from app.scoring.gold_predictor import (
     evaluate_due_predictions,
     optimize_prediction_model_params,
     predict_gold_prices,
+    prediction_due_status_summary,
     prediction_evaluation_summary,
     refresh_prediction_model_metrics,
 )
@@ -70,6 +74,15 @@ from app.scoring.score_optimizer import (
     save_best_params,
 )
 from app.scoring.factor_registry import factor_registry_payload
+from app.ai import analyze_latest_score
+from app.ai.chat import (
+    chat as ai_chat,
+    reset_session as ai_reset_session,
+    get_history as ai_get_history,
+    list_sessions as ai_list_sessions,
+    get_session_messages as ai_get_session_messages,
+    delete_session as ai_delete_session,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -147,6 +160,7 @@ class ExternalIndicatorIn(BaseModel):
 class ActivationRequest(BaseModel):
     operator: str = "dashboard"
     reason: str = ""
+    activation_source: str = "manual"
 
 
 def _json_safe(data: Any) -> str:
@@ -265,6 +279,12 @@ def auto_score_and_broadcast(db: Session, broadcast: bool = False) -> GoldScoreS
         send_text_message(summary_text)
     except Exception:
         pass
+
+    # AI 分析（后台异步，失败不阻塞）
+    try:
+        analyze_latest_score(db)
+    except Exception:
+        pass
  
     # WebSocket 广播（仅异步上下文可用）
     if broadcast:
@@ -320,11 +340,20 @@ def external_indicators_latest(limit: int = 200, db: Session = Depends(get_db)) 
 @app.post("/external/indicators")
 def external_indicator_upsert(payload: ExternalIndicatorIn, db: Session = Depends(get_db)) -> dict[str, object]:
     """写入授权或人工维护的外部市场指标，供后续评分使用。"""
-    from datetime import datetime, timezone
 
-    timestamp = datetime.fromisoformat(payload.timestamp.replace("Z", "+00:00"))
+    allowed_indicator_ids = {str(item.get("indicator_id")) for item in INDICATOR_CATALOG}
+    if payload.indicator_id not in allowed_indicator_ids:
+        raise HTTPException(status_code=400, detail=f"Unknown indicator_id: {payload.indicator_id}")
+    try:
+        timestamp = datetime.fromisoformat(payload.timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="timestamp must be a valid ISO-8601 datetime") from exc
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
+    min_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    max_timestamp = datetime.now(timezone.utc) + timedelta(days=1)
+    if timestamp < min_timestamp or timestamp > max_timestamp:
+        raise HTTPException(status_code=400, detail="timestamp is outside the accepted range")
     with serialized_write():
         upsert_external_indicator(
             db,
@@ -371,6 +400,12 @@ def health_recorder(db: Session = Depends(get_db)) -> dict[str, object]:
         "market_closed": market_closed,
     }
  
+@app.get("/health/collectors")
+def health_collectors() -> dict[str, object]:
+    """采集器健康检查：所有数据源的成功/失败/新鲜度状态。"""
+    from app.monitoring.collector_health import get_health_summary
+    return get_health_summary()
+
 @app.get("/gold/price")
 def gold_price() -> dict[str, object]:
     """获取实时金价（Yahoo Finance，约 15 分钟延迟）。"""
@@ -422,23 +457,27 @@ def prediction_due_status(auto_evaluate: bool = False, db: Session = Depends(get
     if auto_evaluate:
         with serialized_write():
             evaluated_now = evaluate_due_predictions(db)
-    summary = prediction_evaluation_summary(db)
-    s = summary.get("summary", {}) if summary.get("ok") else {}
-    due = int(s.get("due_pending_count") or 0)
-    evaluated = int(s.get("evaluated_count") or 0)
-    future = int(s.get("future_pending_count") or 0)
+    due_summary = prediction_due_status_summary(db)
+    due = int(due_summary.get("due_pending_count") or 0)
+    evaluated = int(due_summary.get("evaluated_count") or 0)
+    future = int(due_summary.get("future_pending_count") or 0)
     return {
         "ok": True,
         "status": "due_pending" if due else ("waiting_for_maturity" if future else "no_snapshots"),
         "evaluated_count": evaluated,
         "due_pending_count": due,
         "future_pending_count": future,
+        "target_evaluated_count": due_summary.get("target_evaluated_count"),
+        "target_horizons": due_summary.get("target_horizons"),
+        "by_horizon": due_summary.get("by_horizon"),
+        "can_evolve": due_summary.get("can_evolve"),
+        "cannot_evolve_reasons": due_summary.get("cannot_evolve_reasons"),
         "auto_evaluated": evaluated_now,
         "message": (
             f"有 {due} 条预测已到期但尚未评估，建议点击补评估。"
             if due else (
-                f"暂无到期预测，仍有 {future} 条等待目标日期。"
-                if future else "暂无预测快照，请先保存一次预测。"
+                due_summary.get("message")
+                or (f"暂无到期预测，仍有 {future} 条等待目标日期。" if future else "暂无预测快照，请先保存一次预测。")
             )
         ),
     }
@@ -483,10 +522,13 @@ def optimize_prediction_models(
     max_mape_pct: float = 8.0,
     min_direction_accuracy: float = 0.52,
     min_samples: int = 120,
-    min_valid_horizons: int = 4,
+    min_valid_horizons: int = 3,
+    min_baseline_lift: float = 0.03,
+    max_mape_worse_ratio: float = 1.2,
+    max_recent_degradation: float = 0.05,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    """生成候选预测模型参数并保存最佳候选，不自动激活。"""
+    """生成 1/7/30 天短周期候选预测模型参数并保存最佳候选。"""
     n_iter = max(1, min(int(n_iter), 300))
     top_k = max(1, min(int(top_k), 20))
     with serialized_write():
@@ -503,6 +545,9 @@ def optimize_prediction_models(
                 "min_direction_accuracy": min_direction_accuracy,
                 "min_samples": min_samples,
                 "min_valid_horizons": min_valid_horizons,
+                "min_baseline_lift": min_baseline_lift,
+                "max_mape_worse_ratio": max_mape_worse_ratio,
+                "max_recent_degradation": max_recent_degradation,
             },
         )
 
@@ -540,7 +585,7 @@ def activate_prediction_model(
         to_version=target.version,
         operator=(payload.operator if payload else "dashboard"),
         reason=(payload.reason if payload else "人工激活预测模型候选"),
-        metrics=metrics,
+        metrics={**metrics, "activation_source": payload.activation_source if payload else "manual"},
     )
     return {
         "ok": True,
@@ -606,6 +651,7 @@ def collect_fred(db: Session = Depends(get_db)) -> dict[str, object]:
 def collect_cftc(db: Session = Depends(get_db)) -> dict[str, object]:
     with serialized_write():
         record = collect_cftc_gold_position(db)
+        db.commit()
         snapshot = auto_score_and_broadcast(db)
     return {"ok": True, "data": serialize_cftc_position(record), "score_updated": serialize_score(snapshot)}
 
@@ -618,6 +664,7 @@ def collect_china_premium(db: Session = Depends(get_db)) -> dict[str, object]:
     """采集中国黄金溢价数据。"""
     with serialized_write():
         record = collect_china_gold_premium(db)
+        db.commit()
     if record is None:
         return {"ok": False, "reason": "No data available."}
     return {
@@ -636,6 +683,7 @@ def collect_cb_gold(db: Session = Depends(get_db)) -> dict[str, object]:
     """采集央行黄金储备数据。"""
     with serialized_write():
         count = collect_central_bank_gold(db)
+        db.commit()
     return {"ok": True, "records_collected": count}
 
 
@@ -648,6 +696,7 @@ def collect_sentiment(
     max_records = max(1, min(int(max_records), 200))
     with serialized_write():
         count = collect_news_sentiment(db, days_back=days_back, max_records=max_records)
+        db.commit()
     return {"ok": True, "records_collected": count}
 
 
@@ -656,6 +705,7 @@ def collect_market_structure(db: Session = Depends(get_db)) -> dict[str, object]
     """采集 GLD ETF 持仓/资金流与 COMEX 库存等市场结构数据。"""
     with serialized_write():
         results = collect_market_structure_data(db)
+        db.commit()
         try:
             snapshot = auto_score_and_broadcast(db)
             score = serialize_score(snapshot)
@@ -906,27 +956,35 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
     latest_prediction_candidate = db.scalar(
         select(PredictionModelVersion).order_by(PredictionModelVersion.created_at.desc())
     )
+    prediction_min_samples = int(settings.get("AUTO_PREDICTION_MIN_SAMPLES") or 120)
     evaluation = prediction_evaluation_summary(db)
+    due_status = prediction_due_status_summary(db, min_samples=prediction_min_samples)
     summary = evaluation.get("summary", {}) if evaluation.get("ok") else {}
     evaluated_count = int(summary.get("evaluated_count") or 0)
     due_pending_count = int(summary.get("due_pending_count") or 0)
-    prediction_min_samples = int(settings.get("AUTO_PREDICTION_MIN_SAMPLES") or 120)
+    target_evaluated_count = int(due_status.get("target_evaluated_count") or 0)
 
     score_ready = bool(
         latest_score_candidate
         and latest_score_candidate.sample_count is not None
         and latest_score_candidate.sample_count >= 120
     )
-    prediction_ready = evaluated_count >= prediction_min_samples
+    prediction_ready = bool(due_status.get("can_evolve"))
     reasons: list[str] = []
     if not score_ready:
         reasons.append("评分优化候选样本不足或尚未生成候选版本。")
     if not prediction_ready:
-        reasons.append(f"预测评估样本 {evaluated_count} 条，低于 {prediction_min_samples} 条门槛。")
+        reasons.extend(due_status.get("cannot_evolve_reasons") or [f"预测评估样本 {evaluated_count} 条，低于 {prediction_min_samples} 条门槛。"])
     if due_pending_count:
         reasons.append(f"有 {due_pending_count} 条到期预测尚未完成评估。")
     if not reasons:
-        reasons.append("样本条件基本满足，可生成候选版本；正式激活仍建议人工审核。")
+        reasons.append("样本条件基本满足，可生成候选版本；预测候选满足强门槛时可受控自动激活。")
+
+    latest_prediction_audit = db.scalar(
+        select(ModelActivationAudit)
+        .where(ModelActivationAudit.model_type == "prediction")
+        .order_by(ModelActivationAudit.created_at.desc())
+    )
 
     return {
         "score_params_version": active_score.version if active_score else "default",
@@ -948,15 +1006,32 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
             "is_active": latest_prediction_candidate.is_active,
         } if latest_prediction_candidate else None,
         "prediction_evaluated_count": evaluated_count,
+        "prediction_target_evaluated_count": target_evaluated_count,
         "prediction_due_pending_count": due_pending_count,
         "prediction_future_pending_count": int(summary.get("future_pending_count") or 0),
+        "prediction_by_horizon": due_status.get("by_horizon"),
         "score_sample_ready": score_ready,
         "prediction_sample_ready": prediction_ready,
         "can_self_evolve": score_ready or prediction_ready,
         "reasons": reasons,
+        "auto_evolution": {
+            "target_horizons": due_status.get("target_horizons"),
+            "can_evolve_prediction": prediction_ready,
+            "sample_threshold": prediction_min_samples,
+            "auto_search_enabled": bool(settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL")),
+            "auto_activate_enabled": bool(settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")),
+            "last_prediction_action": {
+                "action": latest_prediction_audit.action,
+                "from_version": latest_prediction_audit.from_version,
+                "to_version": latest_prediction_audit.to_version,
+                "operator": latest_prediction_audit.operator,
+                "reason": latest_prediction_audit.reason,
+                "created_at": latest_prediction_audit.created_at,
+            } if latest_prediction_audit else None,
+        },
         "policy": {
             "auto_search_allowed": True,
-            "auto_activate_default": False,
+            "auto_activate_default": bool(settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")),
             "manual_review_required": not (
                 settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS")
                 or settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")
@@ -1224,6 +1299,76 @@ def compute_score_with_version(version: str, db: Session = Depends(get_db)) -> d
     with serialized_write():
         snapshot = compute_and_store_gold_score_with_params(db, params, source=version)
     return serialize_score(snapshot)
+
+
+@app.get("/ai/analysis")
+def ai_analysis(db: Session = Depends(get_db)) -> dict[str, object]:
+    """AI 解读最新评分：调用 DeepSeek 生成市场分析和风险解读。
+
+    需要配置 DEEPSEEK_API_KEY 环境变量。
+    未配置时返回 ok=false 但不报错。
+    """
+    result = analyze_latest_score(db)
+    if result is None:
+        return {"ok": False, "error": "AI analysis unavailable"}
+    return result
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    session_id: str = Field(default="default")
+
+
+@app.post("/ai/chat")
+def ai_chat_endpoint(req: ChatRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+    """AI 对话：用户输入事件/信息，AI 结合当前评分给出分析。
+
+    支持多轮对话，同一 session_id 保持上下文。
+    """
+    result = ai_chat(db, req.message, req.session_id)
+    return {"ok": True, **result}
+
+
+@app.post("/ai/chat/reset")
+def ai_chat_reset(session_id: str = "default") -> dict[str, object]:
+    """重置对话会话，清空历史。"""
+    ai_reset_session(session_id)
+    return {"ok": True, "session_id": session_id, "message": "会话已重置"}
+
+
+@app.get("/ai/chat/history")
+def ai_chat_history(session_id: str = "default") -> dict[str, object]:
+    """获取对话历史。"""
+    history = ai_get_history(session_id)
+    return {"ok": True, "session_id": session_id, "messages": history}
+
+
+@app.get("/ai/chat/archive")
+def ai_chat_archive(db: Session = Depends(get_db)) -> dict[str, object]:
+    """列出所有对话会话归档。"""
+    sessions = ai_list_sessions(db)
+    return {"ok": True, "sessions": sessions}
+
+
+@app.get("/ai/chat/archive/{session_id}")
+def ai_chat_archive_detail(session_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    """查看指定归档会话的完整消息。"""
+    messages = ai_get_session_messages(db, session_id)
+    return {"ok": True, "session_id": session_id, "messages": messages}
+
+
+@app.delete("/ai/chat/archive/{session_id}")
+def ai_chat_archive_delete(session_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    """删除指定归档会话。"""
+    ai_delete_session(db, session_id)
+    return {"ok": True, "session_id": session_id, "message": "会话已删除"}
+
+
+@app.get("/ai/ui", response_class=HTMLResponse)
+def ai_chat_ui() -> str:
+    """AI 独立对话窗口页面。"""
+    html_path = Path(__file__).resolve().parent / "ai" / "chat_ui.html"
+    return html_path.read_text(encoding="utf-8")
 
 
 # ── 辅助函数 ─────────────────────────────────────────────────────

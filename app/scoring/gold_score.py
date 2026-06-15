@@ -821,7 +821,6 @@ def compute_gold_score(db: Session) -> ScoreResult:
         risk_flags.append("当前未触发显著宏观风险阈值。")
 
     factor_scores = _filter_registry_scored_factors(factor_scores)
-    factor_scores = _filter_registry_scored_factors(factor_scores)
     raw_factor_scores = dict(factor_scores)
     factor_scores, horizon_details = _aggregate_multi_horizon(raw_factor_scores)
     details["多周期评分"] = {
@@ -859,6 +858,16 @@ def compute_gold_score(db: Session) -> ScoreResult:
 
 def compute_and_store_gold_score(db: Session) -> GoldScoreSnapshot:
     result = compute_gold_score(db)
+    # 每分钟只保留一条，避免重复写入
+    from sqlalchemy import func
+    existing = db.scalar(
+        select(GoldScoreSnapshot).where(
+            func.strftime('%Y-%m-%d %H:%M', GoldScoreSnapshot.timestamp)
+            == result.timestamp.strftime('%Y-%m-%d %H:%M')
+        )
+    )
+    if existing is not None:
+        return existing
     snapshot = GoldScoreSnapshot(
         timestamp=result.timestamp,
         total_score=result.total_score,
@@ -1038,6 +1047,16 @@ def compute_gold_score_with_params(db: Session, params: "ScoreParams") -> ScoreR
 def compute_and_store_gold_score_with_params(db: Session, params: "ScoreParams",
                                               source: str = "rule_v2_optimized") -> GoldScoreSnapshot:
     result = compute_gold_score_with_params(db, params)
+    # 每分钟只保留一条，避免重复写入
+    from sqlalchemy import func
+    existing = db.scalar(
+        select(GoldScoreSnapshot).where(
+            func.strftime('%Y-%m-%d %H:%M', GoldScoreSnapshot.timestamp)
+            == result.timestamp.strftime('%Y-%m-%d %H:%M')
+        )
+    )
+    if existing is not None:
+        return existing
     snapshot = GoldScoreSnapshot(
         timestamp=result.timestamp,
         total_score=result.total_score,
