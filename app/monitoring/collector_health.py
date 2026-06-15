@@ -44,14 +44,40 @@ MAX_CONSECUTIVE_FAILURES = 3
 # ── 内存状态 ────────────────────────────────────────────────────
 
 _collector_state: dict[str, dict[str, Any]] = {}
-_alerted: set[str] = set()  # 已经告警过的采集器名（避免重复告警）
+_alerted: set[str] = set()
+
+
+def _load_state() -> None:
+    """从数据库恢复上次的健康状态。"""
+    try:
+        from app.database import SessionLocal
+        from app.models import AppSetting
+        from sqlalchemy import select as _select
+        import json as _json
+        db = SessionLocal()
+        try:
+            row = db.scalar(_select(AppSetting).where(AppSetting.key == "collector_health_state"))
+            if row and row.value:
+                data = _json.loads(row.value)
+                for k, v in data.items():
+                    last_success = v.get("last_success")
+                    _collector_state[k] = {
+                        "last_success": last_success,
+                        "last_success_dt": datetime.fromisoformat(last_success) if last_success else None,
+                        "consecutive_failures": v.get("consecutive_failures", 0),
+                        "last_error": v.get("last_error"),
+                        "last_detail": v.get("last_detail"),
+                    }
+        finally:
+            db.close()
+    except Exception:
+        pass
 
 
 def record_success(name: str, detail: str = "") -> None:
     """记录采集器成功。"""
     now = datetime.now(timezone.utc)
     prev = _collector_state.get(name, {})
-    prev_consecutive = prev.get("consecutive_failures", 0)
     _collector_state[name] = {
         "last_success": now.isoformat(),
         "last_success_dt": now,
@@ -59,10 +85,43 @@ def record_success(name: str, detail: str = "") -> None:
         "last_error": None,
         "last_detail": detail,
     }
-    # 恢复后清除告警标记
     if name in _alerted:
         _alerted.discard(name)
         logger.info("采集器 %s 已恢复", name)
+    _persist_state()
+
+def _persist_state() -> None:
+    """将当前状态持久化到数据库，防止重启丢失。"""
+    try:
+        from app.database import SessionLocal
+        from app.models import AppSetting
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        import json as _json
+        db = SessionLocal()
+        try:
+            data = {}
+            for k, v in _collector_state.items():
+                data[k] = {
+                    "last_success": v.get("last_success"),
+                    "consecutive_failures": v.get("consecutive_failures", 0),
+                    "last_error": v.get("last_error"),
+                    "last_detail": v.get("last_detail"),
+                }
+            stmt = sqlite_insert(AppSetting).values(
+                key="collector_health_state",
+                value=_json.dumps(data, ensure_ascii=False),
+                updated_at=datetime.now(timezone.utc),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": _json.dumps(data, ensure_ascii=False), "updated_at": datetime.now(timezone.utc)},
+            )
+            db.execute(stmt)
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
 
 
 def record_failure(name: str, error: str) -> None:
@@ -85,6 +144,7 @@ def record_failure(name: str, error: str) -> None:
             name, consecutive, error[:200],
         )
         _try_alert(name, consecutive, error)
+    _persist_state()
 
 
 def _try_alert(name: str, consecutive: int, error: str) -> None:
@@ -104,6 +164,9 @@ def _try_alert(name: str, consecutive: int, error: str) -> None:
 
 def get_health_summary() -> dict[str, Any]:
     """返回所有采集器的健康状态摘要。"""
+    # 首次调用或重启后，从 DB 恢复状态
+    if not _collector_state:
+        _load_state()
     now = datetime.now(timezone.utc)
     collectors_status = []
 
