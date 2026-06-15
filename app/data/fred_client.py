@@ -41,6 +41,7 @@ FRED_SERIES: list[FredSeriesConfig] = [
     FredSeriesConfig("WRESBAL", "存款机构准备金余额", "billions_usd", "weekly"),
     FredSeriesConfig("FYFSD", "美国联邦财政盈余/赤字", "millions_usd", "annual"),
     FredSeriesConfig("GFDEGDQ188S", "美国联邦债务/GDP", "percent", "quarterly"),
+    FredSeriesConfig("CPIAUCSL", "美国 CPI 消费者价格指数", "index", "monthly"),
 ]
 
 

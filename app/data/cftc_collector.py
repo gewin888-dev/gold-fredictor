@@ -48,5 +48,4 @@ def upsert_cftc_position(db: Session, record: CftcPositionRecord, source: str = 
 def collect_cftc_gold_position(db: Session) -> CftcPositionRecord:
     record = CftcClient().fetch_current_gold_position()
     upsert_cftc_position(db, record)
-    db.commit()
     return record

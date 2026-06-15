@@ -38,6 +38,7 @@ FACTOR_DEFINITIONS: tuple[FactorDefinition, ...] = (
     FactorDefinition("美元指数", "中期宏观", "美元走强使黄金对非美买家更贵，通常利空。", "FRED:DTWEXBGS", True, True),
     FactorDefinition("期限溢价", "中期宏观", "期限溢价上升反映财政/期限风险补偿，可能增强黄金配置需求。", "FRED:THREEFYTP10", True, True),
     FactorDefinition("通胀预期", "中期宏观", "通胀预期上升增强保值需求，但需与利率同看。", "FRED:T10YIE", True, True),
+    FactorDefinition("CPI通胀", "中期宏观", "CPI 同比加速→加息预期→利空；减速→宽松预期→利多。", "FRED:CPIAUCSL", True, False),
     FactorDefinition("美元流动性", "中期宏观", "Fed资产负债表、准备金、TGA、RRP 综合代理美元流动性。", "FRED", True, True),
     FactorDefinition("CFTC投机仓位", "中期宏观", "非商业净多占比反映投机资金方向和拥挤度。", "CFTC", True, True),
     FactorDefinition("美股分流", "中期宏观", "美股强势可能分流避险资产需求。", "SINA", True, False),

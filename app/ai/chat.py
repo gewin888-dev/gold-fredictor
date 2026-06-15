@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 
 # Python 3.9 + LibreSSL 兼容性
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# SSL: 使用 certifi CA bundle 替代 verify=False
+import certifi
 
 from app.config import get_settings
 from app.models import ChatMessage, ChatSession, GoldScoreSnapshot
@@ -109,7 +110,7 @@ def _build_system_context(db: Session) -> str:
             import requests as _req
             url = "https://hq.sinajs.cn/list=nf_AU0"
             headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
-            r = _req.get(url, headers=headers, timeout=8, verify=False)
+            r = _req.get(url, headers=headers, timeout=8, verify=certifi.where())
             r.encoding = "gbk"
             fields = r.text.strip().split('"')[1].split(",")
             sh_price = float(fields[5]) if len(fields) > 5 else None
@@ -284,6 +285,35 @@ def _build_system_context(db: Session) -> str:
     except Exception:
         pass
 
+    # ── 6. 系统诊断（模型版本、数据量、预测闭环）──
+    diag_lines = []
+    try:
+        from app.models import ScoreParamsVersion, PredictionModelVersion
+        score_ver = db.scalar(select(ScoreParamsVersion).where(ScoreParamsVersion.is_active == True))
+        pred_ver = db.scalar(select(PredictionModelVersion).where(PredictionModelVersion.is_active == True))
+        diag_lines.append(f"- 评分参数: {score_ver.version if score_ver else 'default rule_v2'}" + (f'（命中率 {score_ver.hit_rate:.0%}）' if score_ver and score_ver.hit_rate else ''))
+        diag_lines.append(f"- 预测模型: {pred_ver.version if pred_ver else 'N/A'}" + (f'（方向准确率 {(pred_ver.direction_accuracy or 0)*100:.0f}%，{pred_ver.evaluated_count or 0}条）' if pred_ver else ''))
+    except Exception:
+        pass
+    try:
+        import sqlite3
+        db_raw = sqlite3.connect('gold_monitor.db')
+        cftc_n = db_raw.execute('SELECT COUNT(*) FROM cftc_positions').fetchone()[0]
+        cftc_latest = db_raw.execute('SELECT MAX(timestamp) FROM cftc_positions').fetchone()[0]
+        diag_lines.append(f"- CFTC 数据: {cftc_n} 条，最新 {cftc_latest[:10] if cftc_latest else 'N/A'}")
+        if cftc_n < 10:
+            insights.append(f"⚠️ CFTC 仅 {cftc_n} 条记录（手工估算），建议接入实时 API。")
+        eval_pending = db_raw.execute(
+            "SELECT COUNT(*) FROM gold_prediction_snapshots s WHERE s.target_timestamp <= datetime('now') AND s.id NOT IN (SELECT prediction_id FROM gold_prediction_evaluations)"
+        ).fetchone()[0]
+        diag_lines.append(f"- 到期未评估预测: {eval_pending} 条")
+        if eval_pending > 0:
+            insights.append(f"⚠️ 有 {eval_pending} 条到期预测尚未评估，方向准确率统计可能滞后。")
+        db_raw.close()
+    except Exception:
+        pass
+    if diag_lines:
+        parts.append("## 系统诊断\n\n" + "\n".join(diag_lines))
     # ── 智能洞察前置 ──
     if insights:
         parts.insert(0, "## ⚠️ 系统主动告警\n\n" + "\n".join(f"- {i}" for i in insights))
@@ -381,7 +411,7 @@ def _call_deepseek(messages: list[dict]) -> str | None:
     last_error = None
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT, verify=False)
+            resp = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT, verify=certifi.where())
             if resp.status_code in (429, 503):
                 wait = min(2 ** attempt, 8)
                 _time.sleep(wait)

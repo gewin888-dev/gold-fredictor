@@ -62,6 +62,12 @@ class CftcClient:
         self.timeout = timeout
 
     def fetch_current_gold_position(self) -> CftcPositionRecord:
-        response = requests.get(self.url, timeout=self.timeout)
-        response.raise_for_status()
+        import sys
+        try:
+            response = requests.get(self.url, timeout=self.timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            detail = f"CFTC API 请求失败: url={self.url}, timeout={self.timeout}s, error={type(exc).__name__}: {exc}"
+            print(detail, file=sys.stderr)
+            raise
         return parse_legacy_futures_only(response.text)

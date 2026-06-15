@@ -292,3 +292,26 @@ class IntradaySnapshot(Base):
     low: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(64), default="SINA", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class ChatSession(Base):
+    """AI 对话会话记录。"""
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), default="新对话", nullable=False)
+    message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class ChatMessage(Base):
+    """AI 对话消息记录。"""
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user / assistant / system
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

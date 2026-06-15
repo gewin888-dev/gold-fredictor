@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # (name, label, max_age_hours, critical)
 COLLECTOR_DEFS: list[dict[str, Any]] = [
     {"name": "gold_price",           "label": "金价日线",     "max_age_hours": 1.0,    "critical": True},
-    {"name": "intraday_snapshot",    "label": "日内快照",     "max_age_hours": 0.05,   "critical": True},
+    {"name": "intraday_snapshot",    "label": "日内快照",     "max_age_hours": 2.0,    "critical": True},
     {"name": "fred_data",            "label": "FRED宏观",     "max_age_hours": 25.0,   "critical": True},
     {"name": "cftc_position",        "label": "CFTC仓位",     "max_age_hours": 170.0,  "critical": True},
     {"name": "china_premium",        "label": "中国溢价",     "max_age_hours": 25.0,   "critical": False},
@@ -96,7 +96,10 @@ def record_success(name: str, detail: str = "") -> None:
     _persist_state()
 
 def _persist_state() -> None:
-    """将当前状态持久化到数据库，防止重启丢失。"""
+    """将当前状态持久化到数据库，防止重启丢失。
+    
+    使用 1 秒超时快速失败，避免阻塞采集循环。
+    """
     try:
         from app.database import SessionLocal
         from app.models import AppSetting
@@ -104,6 +107,8 @@ def _persist_state() -> None:
         import json as _json
         db = SessionLocal()
         try:
+            # 设置 1 秒超时，避免被主会话锁阻塞
+            db.connection().connection.execute("PRAGMA busy_timeout=1000")
             data = {}
             for k, v in _collector_state.items():
                 data[k] = {

@@ -100,5 +100,4 @@ def collect_market_structure_data(db: Session) -> dict[str, dict[str, object]]:
             "reason": "中印实物需求需要进口、节庆和本地溢价数据；当前预留手动录入。",
         },
     }
-    db.commit()
     return results

@@ -175,6 +175,52 @@ def test_score_factor_registry_exposes_scoring_and_gray_status():
     assert factors["地缘风险"]["scored"] is False
 
 
+def test_external_indicator_rejects_unknown_indicator(db_session):
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/external/indicators",
+            json={
+                "indicator_id": "UNKNOWN_FACTOR",
+                "timestamp": "2026-06-14T00:00:00Z",
+                "value": 1.0,
+                "source": "TEST",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert "Unknown indicator_id" in response.json()["detail"]
+
+
+def test_external_indicator_rejects_invalid_timestamp(db_session):
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/external/indicators",
+            json={
+                "indicator_id": "GEO_RISK_INTENSITY",
+                "timestamp": "not-a-date",
+                "value": 1.0,
+                "source": "TEST",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert "ISO-8601" in response.json()["detail"]
+
+
 def test_deactivate_score_params_endpoint_restores_default(db_session):
     from app.models import ScoreParamsVersion
 

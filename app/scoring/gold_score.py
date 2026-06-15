@@ -55,6 +55,7 @@ OVERNIGHT_RRP = "RRPONTSYD"         # 隔夜逆回购
 BANK_RESERVES = "WRESBAL"           # 准备金余额
 FEDERAL_DEFICIT = "FYFSD"           # 联邦财政盈余/赤字
 DEBT_TO_GDP = "GFDEGDQ188S"         # 联邦债务/GDP
+CPI = "CPIAUCSL"                     # 美国 CPI 消费者价格指数
 SP500 = "SP500"                      # 标普 500（美股分流效应）
 SILVER = "SILVER"                    # 白银价格（新浪 hf_SI）
 GLD_ETF = "GLD_ETF"                  # SPDR Gold Trust ETF 价格
@@ -69,11 +70,11 @@ BONUS_FRED_SERIES = [
     SP500, SILVER, GLD_ETF, GOOGLE_TREND, GDX, WTI, COPPER,
     GOLD_VOLATILITY, REAL_RATE_5Y, REAL_RATE_30Y, TERM_PREMIUM_10Y, FED_BALANCE_SHEET,
     TREASURY_GENERAL_ACCOUNT, OVERNIGHT_RRP, BANK_RESERVES, FEDERAL_DEFICIT,
-    DEBT_TO_GDP,
+    DEBT_TO_GDP, CPI,
 ]
-TRUSTED_SCORING_SOURCES = {"FRED", "YAHOO", "CFTC", "GDELT", "WGC", "IMF", "SGE", "SINA", "LBMA", "TEST", "NEWSAPI", "GOOGLE_TRENDS", "SPDR", "CME", "CBOE"}
+TRUSTED_SCORING_SOURCES = {"FRED", "YAHOO", "CFTC", "GDELT", "WGC", "IMF", "SGE", "SINA", "LBMA", "TEST", "NEWSAPI", "GOOGLE_TRENDS", "SPDR", "CME", "CBOE", "MANUAL", "MANUAL_ESTIMATE"}
 # 中国溢价可信评分源
-PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST", "SINA"}
+PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST", "SINA", "MANUAL"}
 
 
 def _filter_registry_scored_factors(factor_scores: dict[str, float]) -> dict[str, float]:
@@ -97,6 +98,15 @@ class ScoreResult:
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 
+def _normalize_ts(ts):
+    """Normalize timestamp to timezone-naive UTC for consistent comparison."""
+    if ts is None:
+        return None
+    if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+        return ts.replace(tzinfo=None)
+    return ts
+
+
 def _series_frame(db: Session, series_id: str) -> pd.DataFrame:
     rows = db.scalars(
         select(MacroObservation)
@@ -106,7 +116,7 @@ def _series_frame(db: Session, series_id: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", series_id])
     return pd.DataFrame(
-        [{"timestamp": row.timestamp, series_id: row.value} for row in rows]
+        [{"timestamp": _normalize_ts(row.timestamp), series_id: row.value} for row in rows]
     ).sort_values("timestamp")
 
 
@@ -117,7 +127,7 @@ def _gold_price_frame(db: Session) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "gold_price"])
     return pd.DataFrame(
-        [{"timestamp": row.date, "gold_price": row.close} for row in rows]
+        [{"timestamp": _normalize_ts(row.date), "gold_price": row.close} for row in rows]
     ).sort_values("timestamp")
 
 
@@ -202,6 +212,7 @@ HORIZON_GROUPS: dict[str, tuple[float, tuple[str, ...]]] = {
             "联邦基金",
             "美元指数",
             "通胀预期",   # 通胀预期主归属 → 中期
+            "CPI通胀",    # CPI 实际通胀 → 中期
             "CFTC投机仓位",
             "美股分流",
             "铜/金比",
@@ -305,15 +316,17 @@ def _aligned_gold_macro_frame(db: Session, gold_prices: pd.DataFrame) -> tuple[p
 
     merged = merged.dropna(subset=["gold_price", *REQUIRED_FRED_SERIES])
 
-    # 可选指标（不阻塞）
+    # 可选指标（不阻塞，单独合并再 left-join 避免缩小主框架行数）
     for sid in BONUS_FRED_SERIES:
         bonus = _series_frame(db, sid)
         if not bonus.empty:
-            merged = pd.merge_asof(
-                merged.sort_values("timestamp"),
-                bonus.sort_values("timestamp"),
+            bonus_sorted = bonus.sort_values("timestamp")
+            bonus_merged = pd.merge_asof(
+                merged[["timestamp"]].sort_values("timestamp"),
+                bonus_sorted,
                 on="timestamp", direction="backward",
             )
+            merged[sid] = bonus_merged[sid].values
 
     return merged, []
 
@@ -658,6 +671,29 @@ def compute_gold_score(db: Session) -> ScoreResult:
                                    "10日变化": _latest_change(merged, INFLATION_EXPECTATION, 10) or 0,
                                    "20日变化": _latest_change(merged, INFLATION_EXPECTATION, 20) or 0}
 
+    # CPI — 消费者价格指数同比（月度）
+    # 逻辑：CPI 同比加速 → 通胀升温 → Fed 加息预期 → 实际利率上行 → 利空黄金(-)
+    #       CPI 同比减速 → 通胀回落 → Fed 宽松预期 → 实际利率下行 → 利多黄金(+)
+    #       与通胀预期(T10YIE)互补：T10YIE 反映市场预期，CPI 反映实际发生
+    if CPI in merged.columns:
+        cpi_series = merged[["timestamp", CPI]].dropna()
+        if len(cpi_series) > 0:
+            latest_row = cpi_series.iloc[-1]
+            latest_val = float(latest_row[CPI])
+            latest_ts = pd.Timestamp(latest_row["timestamp"])
+            # 日期匹配：找刚好 12 个月前的 CPI 值
+            target_date = latest_ts - pd.DateOffset(months=12)
+            # 找最近的数据点（用 timestamp 列比较，不用 index）
+            earlier = cpi_series[cpi_series["timestamp"] <= target_date]
+            if len(earlier) > 0:
+                yoy_val = float(earlier[CPI].iloc[-1])
+                if yoy_val > 0:
+                    cpi_yoy = (latest_val / yoy_val - 1) * 100
+                    factor_scores["CPI通胀"] = round(_clamp(-cpi_yoy * 5, -10, 10), 2)
+                    details["CPI通胀"] = {"当前": round(latest_val, 1),
+                                         "12月前": round(yoy_val, 1),
+                                         "同比%": round(cpi_yoy, 2)}
+
     # 7. P0-2: 黄金趋势 — 连续百分比值
     gold_ma20 = merged["gold_price"].tail(20).mean()
     gold_ma60 = merged["gold_price"].tail(60).mean()
@@ -955,6 +991,28 @@ def compute_gold_score_with_params(db: Session, params: "ScoreParams") -> ScoreR
             _clamp(ie_change * params.inflation_coef, params.inflation_clamp_low, params.inflation_clamp_high), 2
         )
 
+    # CPI — 消费者价格指数同比（月度）
+    # 逻辑：CPI 同比加速 → 通胀升温 → Fed 加息预期 → 实际利率上行 → 利空黄金(-)
+    #       CPI 同比减速 → 通胀回落 → Fed 宽松预期 → 实际利率下行 → 利多黄金(+)
+    #       与通胀预期(T10YIE)互补：T10YIE 反映市场预期，CPI 反映实际发生
+    if CPI in merged.columns:
+        cpi_df = merged[[CPI, "timestamp"]].dropna(subset=[CPI])
+        if len(cpi_df) >= 13:
+            # 用 timestamp 列做日期匹配，避免 index 类型问题
+            cpi_df = cpi_df.sort_values("timestamp")
+            latest_ts = cpi_df["timestamp"].iloc[-1]
+            latest_val = float(cpi_df[CPI].iloc[-1])
+            target_ts = latest_ts - pd.DateOffset(months=12)
+            earlier = cpi_df[cpi_df["timestamp"] <= target_ts]
+            if len(earlier) > 0:
+                yoy_val = float(earlier[CPI].iloc[-1])
+                if yoy_val > 0:
+                    cpi_yoy = (latest_val / yoy_val - 1) * 100
+                    factor_scores["CPI通胀"] = round(_clamp(-cpi_yoy * 5, -10, 10), 2)
+                    details["CPI通胀"] = {"当前": round(latest_val, 1),
+                                         "12月前": round(yoy_val, 1),
+                                         "同比%": round(cpi_yoy, 2)}
+
     # 黄金趋势 — 连续百分比
     gold_col = merged["gold_price"].dropna()
     if len(gold_col) >= params.trend_ma_long:
@@ -1004,6 +1062,74 @@ def compute_gold_score_with_params(db: Session, params: "ScoreParams") -> ScoreR
 
     # 第二阶段宏观/授权指标也参与优化参数评分路径；参数优化仍控制核心老因子权重。
     _add_second_stage_factor_scores(db, merged, factor_scores, details, risk_flags, params)
+
+    # ── 市场关联因子（与基础版保持一致）──
+    # 美股分流效应
+    if SP500 in merged.columns:
+        sp_clean = merged[[SP500]].dropna()
+        if len(sp_clean) > 10:
+            sp_change = (float(sp_clean[SP500].iloc[-1]) / float(sp_clean[SP500].iloc[-11]) - 1) * 100
+            factor_scores["美股分流"] = round(_clamp(-sp_change * 0.01, -10, 10), 2)
+
+    # 白银/黄金比
+    if SILVER in merged.columns:
+        ag_au = merged[[SILVER, "gold_price"]].dropna()
+        if len(ag_au) > 5:
+            ratio_now = float(ag_au[SILVER].iloc[-1]) / float(ag_au["gold_price"].iloc[-1])
+            ratio_prev = float(ag_au[SILVER].iloc[-6]) / float(ag_au["gold_price"].iloc[-6])
+            ratio_score = (ratio_now / ratio_prev - 1) * 80
+            factor_scores["白银/黄金比"] = round(_clamp(ratio_score, -6, 6), 2)
+
+    # GLD ETF
+    if GLD_ETF in merged.columns:
+        gld_clean = merged[[GLD_ETF]].dropna()
+        if len(gld_clean) > 10:
+            gld_change = (float(gld_clean[GLD_ETF].iloc[-1]) / float(gld_clean[GLD_ETF].iloc[-11]) - 1) * 100
+            factor_scores["GLD ETF"] = round(_clamp(gld_change * 0.05, -10, 10), 2)
+
+    # 美元人民币
+    usdcny_row = db.scalar(select(ChinaGoldPremium).order_by(ChinaGoldPremium.timestamp.desc()))
+    if usdcny_row and usdcny_row.usdcny:
+        oldest = db.scalar(
+            select(ChinaGoldPremium)
+            .where(ChinaGoldPremium.usdcny.isnot(None))
+            .order_by(ChinaGoldPremium.timestamp.asc())
+        )
+        if oldest and oldest.usdcny and oldest.timestamp < usdcny_row.timestamp:
+            cny_change = float(usdcny_row.usdcny) - float(oldest.usdcny)
+            factor_scores["美元人民币"] = round(_clamp(cny_change * 2, -10, 10), 2)
+
+    # 搜索热度
+    if GOOGLE_TREND in merged.columns:
+        trend_clean = merged[[GOOGLE_TREND]].dropna()
+        if len(trend_clean) > 20:
+            trend_now = float(trend_clean[GOOGLE_TREND].iloc[-1])
+            trend_ma20 = float(trend_clean[GOOGLE_TREND].tail(20).mean())
+            heat_score = (trend_now / max(trend_ma20, 1) - 1) * 50
+            factor_scores["搜索热度"] = round(_clamp(heat_score, -8, 3), 2)
+
+    # 矿业股GDX
+    if GDX in merged.columns:
+        gdx_clean = merged[[GDX]].dropna()
+        if len(gdx_clean) > 5:
+            gdx_chg = (float(gdx_clean[GDX].iloc[-1]) / float(gdx_clean[GDX].iloc[-6]) - 1) * 100
+            factor_scores["矿业股GDX"] = round(_clamp(gdx_chg * 0.3, -10, 10), 2)
+
+    # 原油WTI
+    if WTI in merged.columns:
+        wti_clean = merged[[WTI]].dropna()
+        if len(wti_clean) > 5:
+            wti_chg = (float(wti_clean[WTI].iloc[-1]) / float(wti_clean[WTI].iloc[-6]) - 1) * 100
+            factor_scores["原油WTI"] = round(_clamp(wti_chg * 0.03, -10, 10), 2)
+
+    # 铜/金比
+    if COPPER in merged.columns:
+        cu_au = merged[[COPPER, "gold_price"]].dropna()
+        if len(cu_au) > 5:
+            ratio_now = float(cu_au[COPPER].iloc[-1]) / float(cu_au["gold_price"].iloc[-1])
+            ratio_prev = float(cu_au[COPPER].iloc[-6]) / float(cu_au["gold_price"].iloc[-6])
+            ratio_change = (ratio_now / ratio_prev - 1) * 100
+            factor_scores["铜/金比"] = round(_clamp(-ratio_change * 1.5, -5, 5), 2)
 
     # 风险汇总
     if latest[REAL_RATE] >= 2.0:

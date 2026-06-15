@@ -1,4 +1,4 @@
-"""NewsAPI 新闻情绪采集器。
+"""NewsAPI 新闻情绪采集器（VADER 情感分析版）。
 
 数据来源：NewsAPI.org — 免费 100 次/天，全球新闻聚合
 采集逻辑：搜索 gold 相关新闻 → 关键词情感打分 → SQLite 入库
@@ -7,15 +7,17 @@
 from __future__ import annotations
 
 import re
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from app.models import NewsSentiment
 
 NEWSAPI_URL = "https://newsapi.org/v2/everything"
@@ -36,17 +38,41 @@ BEARISH = [
 ]
 
 
+_vader: SentimentIntensityAnalyzer | None = None
+
+def _get_vader() -> SentimentIntensityAnalyzer:
+    global _vader
+    if _vader is None:
+        _vader = SentimentIntensityAnalyzer()
+    return _vader
+
+def _vader_sentiment(text: str) -> float:
+    if not text or not text.strip():
+        return 0.0
+    scores = _get_vader().polarity_scores(text)
+    return round(scores["compound"] * 5.0, 3)
+
+def _gold_keyword_direction(text: str) -> int:
+    text_lower = text.lower()
+    bull = sum(1 for kw in BULLISH if re.search(kw, text_lower, re.IGNORECASE))
+    bear = sum(1 for kw in BEARISH if re.search(kw, text_lower, re.IGNORECASE))
+    if bull > bear: return 1
+    elif bear > bull: return -1
+    return 0
+
+def _gold_sentiment(title: str, description: str = "") -> float:
+    text = (title + " " + description[:300]).strip()
+    if not text: return 0.0
+    vader_s = _vader_sentiment(text)
+    kw_d = _gold_keyword_direction(text)
+    if kw_d == 0:
+        return round(vader_s * 0.5, 3)
+    magnitude = max(0.3, abs(vader_s))
+    return round(kw_d * magnitude, 3)
+
 def _text_sentiment(title: str, description: str = "") -> float:
-    """基于关键词的情感评分。综合标题和描述。正值=利多，负值=利空。"""
-    text = (title + " " + description).lower()
-    score = 0.0
-    for kw in BULLISH:
-        if re.search(kw, text, re.IGNORECASE):
-            score += 1.2
-    for kw in BEARISH:
-        if re.search(kw, text, re.IGNORECASE):
-            score -= 1.2
-    return max(-5.0, min(5.0, score))
+    """兼容旧调用"""
+    return _gold_sentiment(title, description)
 
 
 def collect_news_sentiment(
@@ -118,18 +144,20 @@ def collect_news_sentiment(
                 continue
             seen_urls.add(url)
 
-            sent = _text_sentiment(title, description)
+            spread_seconds = count * 23
+            article_ts = now - timedelta(seconds=spread_seconds)
+            sent = _gold_sentiment(title, description)
 
             summary = description[:300] if description else None
             stmt = sqlite_insert(NewsSentiment).values(
-                timestamp=now,
+                timestamp=article_ts,
                 source_url=url,
                 title=title[:500],
                 sentiment_score=sent,
                 relevance=None,
                 summary=summary,
                 source="NEWSAPI",
-                updated_at=now,
+                updated_at=article_ts,
             )
             db.execute(stmt)
             count += 1
@@ -141,7 +169,7 @@ def collect_news_sentiment(
 
 def get_recent_sentiment(db: Session, days: int = 7) -> float | None:
     """获取最近 N 天平均新闻情绪评分。"""
-    from sqlalchemy import func, select
+    from sqlalchemy import case, func, select
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     result = db.scalar(
@@ -151,6 +179,36 @@ def get_recent_sentiment(db: Session, days: int = 7) -> float | None:
         )
     )
     return round(float(result), 4) if result else None
+
+
+def get_daily_sentiment_trend(db: Session, days: int = 30) -> list[dict[str, Any]]:
+    """获取每日情绪聚合趋势，用于仪表盘折线图。"""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.execute(
+        select(
+            func.date(NewsSentiment.timestamp).label("day"),
+            func.avg(NewsSentiment.sentiment_score).label("avg_score"),
+            func.count().label("count"),
+            func.sum(
+                case((NewsSentiment.sentiment_score > 0, 1), else_=0)
+            ).label("bullish_count"),
+        )
+        .where(
+            NewsSentiment.timestamp >= cutoff,
+            NewsSentiment.source.in_(["NEWSAPI", "GDELT"]),
+        )
+        .group_by("day")
+        .order_by("day")
+    ).all()
+    return [
+        {
+            "date": str(day),
+            "avg_score": round(float(avg), 3) if avg else 0.0,
+            "count": int(cnt),
+            "bullish_pct": round(float(bull) / int(cnt), 3) if cnt else 0.0,
+        }
+        for day, avg, cnt, bull in rows
+    ]
 
 
 def load_sample_sentiment(db: Session, days: int = 30) -> int:

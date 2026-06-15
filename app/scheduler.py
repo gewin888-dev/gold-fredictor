@@ -150,10 +150,16 @@ def _collect_google_trend_snapshot(db: Session) -> None:
 
 def collect_and_score_job() -> None:
     """定时任务：采集所有数据 → 评分 → 阈值告警 → 每日报告推送。"""
+    import time as _time
+    _start = _time.time()
+    def _tick(label: str) -> None:
+        logger.info("[collect_and_score] %s (+%.1fs)", label, _time.time() - _start)
+
     # 先刷新金价日线（独立 DB 会话，失败不阻塞后续采集）
     try:
         fetch_gold_history(days=1)
         record_success("gold_price", "hourly refresh")
+        _tick("gold_price")
     except Exception:
         logger.warning("金价日线刷新失败（已跳过，不中断整体流程）", exc_info=True)
         record_failure("gold_price", "fetch_gold_history failed")
@@ -181,13 +187,16 @@ def collect_and_score_job() -> None:
             try:
                 collector(db)
                 record_success(health_name, "ok")
+                _tick(label)
             except Exception:
                 logger.warning("采集器 %s 失败（已跳过，不中断整体流程）", label, exc_info=True)
                 record_failure(health_name, f"collector {label} failed")
+                _tick(f"{label}_FAILED")
 
         # 所有采集器完成后统一提交，写入操作受串行锁保护
         with serialized_write():
             db.commit()
+        _tick("commit")
 
         # 优先使用激活的优化参数
         active_params = get_active_params(db)
@@ -195,11 +204,13 @@ def collect_and_score_job() -> None:
             snapshot = compute_and_store_gold_score_with_params(db, active_params, source="optimized_active")
         else:
             snapshot = compute_and_store_gold_score(db)
+        _tick(f"score({snapshot.total_score})")
 
         # 记录一次预测快照，并评估已到期的历史预测。
         predict_gold_prices(db, persist=True)
         evaluate_due_predictions(db)
         rollback_degraded_prediction_model(db)
+        _tick("predict")
 
         # 安全网：如果激活模型方向准确率接近0且存在更好的候选，自动切换
         try:
@@ -244,6 +255,7 @@ def collect_and_score_job() -> None:
 
         # 阈值告警（因子突变即时推送）
         send_threshold_alerts(db, snapshot)
+        _tick("threshold_alerts")
 
         # 每小时推送精简版，每日完整版（UTC 22:00 是北京时间 06:00）
         from datetime import datetime, timezone

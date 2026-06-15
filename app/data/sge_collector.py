@@ -157,7 +157,6 @@ def collect_china_gold_premium(db: Session) -> ChinaGoldPremium | None:
         },
     )
     db.execute(stmt)
-    db.commit()
     return record
 
 

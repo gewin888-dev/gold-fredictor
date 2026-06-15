@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 from dataclasses import asdict, dataclass, field
@@ -18,6 +19,9 @@ from typing import Any
 import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
 from app.models import (
     CftcPosition,
     GoldPrice,
@@ -107,11 +111,24 @@ class ScoreParams:
     bullish_threshold: float = 30.0
     bearish_threshold: float = -30.0
 
+    # 参数结构版本（增减因子时递增，防止旧 JSON 静默漂移）
+    schema_version: int = 1
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["schema_version"] = self.schema_version
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ScoreParams":
+        stored_version = d.get("schema_version", 0)
+        if stored_version != cls.schema_version:
+            import logging
+            logging.getLogger(__name__).warning(
+                "ScoreParams schema version mismatch: stored=%s, current=%s. "
+                "Scoring may differ due to missing or added fields.",
+                stored_version, cls.schema_version,
+            )
         return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
     @classmethod
@@ -320,7 +337,11 @@ def compute_score_at_date(
     ]:
         if col not in hist.columns:
             continue
+        if col not in hist.columns or hist[col].dropna().empty:
+            continue
         clean = hist[[col]].dropna()
+        if clean.empty:
+            continue
         if len(clean) > params.trend_ma_short:
             base = float(clean[col].iloc[-1 - params.trend_ma_short])
             if base:
@@ -612,7 +633,11 @@ def optimize_score_params(
     results = []
     for i, params in enumerate(all_candidates):
         label = "baseline" if i == 0 else f"candidate_{i}"
-        eval_result = evaluate_params(db, params, horizon_days=horizon_days)
+        try:
+            eval_result = evaluate_params(db, params, horizon_days=horizon_days)
+        except Exception:
+            logger.debug("优化搜索: 候选 %s 评估失败，跳过", label, exc_info=True)
+            continue
         results.append(
             {
                 "label": label,

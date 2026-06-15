@@ -29,12 +29,14 @@ from app.models import (
     GoldPredictionSnapshot,
     GoldPrice,
     GoldScoreSnapshot,
+    ModelActivationAudit,
     MacroObservation,
     PredictionModelVersion,
 )
 from app.models import utc_now
 
 HORIZONS = [1, 7, 30, 90, 180, 360]
+EVOLUTION_HORIZONS = [1, 7, 30]
 MIN_RETURN_SAMPLES = 20
 EXCLUDED_TRAINING_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
 DEFAULT_MODEL_VERSION = "predictor_v2_baseline"
@@ -50,8 +52,8 @@ DEFAULT_MODEL_PARAMS: dict[str, float] = {
     "short_momentum_weight": 0.6,
     "short_score_weight": 0.4,
     "score_similarity_sigma": 15.0,
-    "short_return_clip_pct": 30.0,
-    "long_annual_base_return_pct": 8.0,
+    "short_return_clip_pct": 24.0,
+    "long_annual_base_return_pct": 5.0,
     "long_macro_adjustment_scale": 3.0,
     "long_return_clip_low_pct": -20.0,
     "long_return_clip_high_pct": 50.0,
@@ -71,12 +73,12 @@ PREDICTION_PARAM_SPACE: dict[str, list[float]] = {
 }
 
 OPTIMIZATION_HORIZON_WEIGHTS: dict[str, float] = {
-    "1": 0.18,
-    "7": 0.22,
-    "30": 0.24,
-    "90": 0.18,
-    "180": 0.10,
-    "360": 0.08,
+    "1": 0.34,
+    "7": 0.33,
+    "30": 0.33,
+    "90": 0.0,
+    "180": 0.0,
+    "360": 0.0,
 }
 
 
@@ -124,6 +126,31 @@ def json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
+def _record_model_audit(
+    db: Session,
+    *,
+    action: str,
+    from_version: str | None,
+    to_version: str,
+    operator: str,
+    reason: str,
+    metrics: dict[str, Any] | None = None,
+) -> ModelActivationAudit:
+    row = ModelActivationAudit(
+        model_type="prediction",
+        action=action,
+        from_version=from_version,
+        to_version=to_version,
+        operator=operator,
+        reason=reason,
+        metrics_json=json_dumps(metrics or {}),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def _active_prediction_model(db: Session) -> PredictionModelVersion:
     default_model = ensure_default_prediction_model(db)
     active = db.scalar(
@@ -145,6 +172,9 @@ def _model_params(model: PredictionModelVersion) -> dict[str, float]:
             params[key] = float(raw.get(key, default_value))
         except (TypeError, ValueError):
             params[key] = default_value
+    # 安全上限：长期年化基准不超过 5%（高金价环境下 12% 过于乐观）
+    if params.get("long_annual_base_return_pct", 5.0) > 5.0:
+        params["long_annual_base_return_pct"] = 5.0
     return params
 
 
@@ -416,7 +446,7 @@ def evaluate_due_predictions(db: Session, limit: int = 500) -> dict[str, Any]:
         abs_pct_error = (abs_error / actual_price * 100) if actual_price else None
         actual_return = (actual_price / current_price - 1) * 100 if current_price else 0.0
         predicted_return = float(pred.expected_return_pct)
-        direction_hit = _direction_with_deadband(predicted_return) == _direction_with_deadband(actual_return)
+        direction_hit = _direction_with_deadband(predicted_return, pred.horizon_days) == _direction_with_deadband(actual_return, pred.horizon_days)
 
         db.add(
             GoldPredictionEvaluation(
@@ -448,8 +478,17 @@ def evaluate_due_predictions(db: Session, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def _direction_with_deadband(return_pct: float, deadband_pct: float = 0.25) -> int:
-    if abs(return_pct) < deadband_pct:
+def _direction_with_deadband(return_pct: float, horizon_days: int) -> int:
+    """按 horizon 差异化 deadband：短 horizon 用窄波段，避免微弱信号被中性化。"""
+    if horizon_days <= 1:
+        deadband = 0.05
+    elif horizon_days <= 7:
+        deadband = 0.15
+    elif horizon_days <= 30:
+        deadband = 0.25
+    else:
+        deadband = 0.50
+    if abs(return_pct) < deadband:
         return 0
     return 1 if return_pct > 0 else -1
 
@@ -481,8 +520,29 @@ def refresh_prediction_model_metrics(db: Session) -> None:
     db.commit()
 
 
+def _model_version_summary(model, due_count: int, future_count: int) -> dict[str, Any]:
+    """从 PredictionModelVersion 表构建摘要（无逐条评估数据时回退）。"""
+    return {
+        "ok": True,
+        "summary": {
+            "evaluated_count": model.evaluated_count or 0,
+            "due_pending_count": due_count,
+            "future_pending_count": future_count,
+            "mae_price": round(model.mae_price, 4) if model.mae_price else None,
+            "mape_price_pct": round(model.mape_price_pct, 4) if model.mape_price_pct else None,
+            "direction_accuracy": round(model.direction_accuracy, 4) if model.direction_accuracy else None,
+            "active_model": model.version,
+        },
+        "by_horizon": [],
+        "by_model": [],
+    }
+
+
 def prediction_evaluation_summary(db: Session) -> dict[str, Any]:
-    """返回分 horizon / 分模型版本的预测验证汇总。"""
+    """返回分 horizon / 分模型版本的预测验证汇总。
+    
+    摘要指标优先使用当前激活模型的评估数据。
+    """
     rows = db.scalars(select(GoldPredictionEvaluation)).all()
     pending = db.scalars(select(GoldPredictionSnapshot)).all()
     evaluated_ids = {int(r.prediction_id) for r in rows}
@@ -496,7 +556,14 @@ def prediction_evaluation_summary(db: Session) -> dict[str, Any]:
         if _aware_utc(p.target_timestamp) > now and int(p.id) not in evaluated_ids
     ]
 
+    # 获取当前激活的预测模型
+    active_model = _active_prediction_model(db)
+    active_version = active_model.version if active_model else None
+
     if not rows:
+        # 回退到模型版本表中的指标
+        if active_model and active_model.evaluated_count:
+            return _model_version_summary(active_model, len(due_pending), len(future_pending))
         return {
             "ok": True,
             "summary": {
@@ -536,19 +603,106 @@ def prediction_evaluation_summary(db: Session) -> dict[str, Any]:
             out.append(item)
         return out
 
+    # 摘要：优先用激活模型的评估数据；无匹配则回退到模型版本表指标
+    if active_version:
+        active_df = df[df["model_version"] == active_version]
+        if len(active_df) >= 5:  # 至少 5 条才有统计意义
+            summary_df = active_df
+        elif active_model and active_model.evaluated_count:
+            # 评估数据不足，用模型版本表的预计算指标
+            result = _model_version_summary(active_model, len(due_pending), len(future_pending))
+            result["by_horizon"] = sorted(_group_summary(["horizon_days"]), key=lambda x: x["horizon_days"])
+            result["by_model"] = sorted(_group_summary(["model_version"]), key=lambda x: x["model_version"])
+            return result
+        else:
+            summary_df = df
+    else:
+        summary_df = df
+
     return {
         "ok": True,
         "summary": {
-            "evaluated_count": int(len(df)),
+            "evaluated_count": int(len(summary_df)),
             "due_pending_count": len(due_pending),
             "future_pending_count": len(future_pending),
-            "mae_price": round(float(df["abs_error_price"].mean()), 4),
-            "mape_price_pct": round(float(df["abs_pct_error"].dropna().mean()), 4)
-            if not df["abs_pct_error"].dropna().empty else None,
-            "direction_accuracy": round(float(df["direction_hit"].mean()), 4),
+            "mae_price": round(float(summary_df["abs_error_price"].mean()), 4),
+            "mape_price_pct": round(float(summary_df["abs_pct_error"].dropna().mean()), 4)
+            if not summary_df["abs_pct_error"].dropna().empty else None,
+            "direction_accuracy": round(float(summary_df["direction_hit"].mean()), 4),
+            "active_model": active_version,
         },
         "by_horizon": sorted(_group_summary(["horizon_days"]), key=lambda x: x["horizon_days"]),
         "by_model": sorted(_group_summary(["model_version"]), key=lambda x: x["model_version"]),
+    }
+
+
+def prediction_due_status_summary(
+    db: Session,
+    min_samples: int = 120,
+    target_horizons: list[int] | None = None,
+) -> dict[str, Any]:
+    """按 horizon 汇总预测闭环状态，并判断是否满足短周期进化样本门槛。"""
+    target_horizons = target_horizons or EVOLUTION_HORIZONS
+    evaluations = db.scalars(select(GoldPredictionEvaluation)).all()
+    snapshots = db.scalars(select(GoldPredictionSnapshot)).all()
+    evaluated_ids = {int(row.prediction_id) for row in evaluations}
+    now = utc_now()
+
+    by_horizon: dict[int, dict[str, Any]] = {
+        horizon: {
+            "horizon_days": horizon,
+            "evaluated_count": 0,
+            "due_pending_count": 0,
+            "future_pending_count": 0,
+        }
+        for horizon in HORIZONS
+    }
+    for row in evaluations:
+        item = by_horizon.setdefault(
+            int(row.horizon_days),
+            {"horizon_days": int(row.horizon_days), "evaluated_count": 0, "due_pending_count": 0, "future_pending_count": 0},
+        )
+        item["evaluated_count"] += 1
+    for row in snapshots:
+        if int(row.id) in evaluated_ids:
+            continue
+        item = by_horizon.setdefault(
+            int(row.horizon_days),
+            {"horizon_days": int(row.horizon_days), "evaluated_count": 0, "due_pending_count": 0, "future_pending_count": 0},
+        )
+        if _aware_utc(row.target_timestamp) <= now:
+            item["due_pending_count"] += 1
+        else:
+            item["future_pending_count"] += 1
+
+    total_evaluated = sum(item["evaluated_count"] for item in by_horizon.values())
+    total_due = sum(item["due_pending_count"] for item in by_horizon.values())
+    total_future = sum(item["future_pending_count"] for item in by_horizon.values())
+    target_evaluated = sum(by_horizon.get(h, {}).get("evaluated_count", 0) for h in target_horizons)
+    missing_target_horizons = [
+        h for h in target_horizons
+        if by_horizon.get(h, {}).get("evaluated_count", 0) <= 0
+    ]
+    reasons: list[str] = []
+    if target_evaluated < min_samples:
+        reasons.append(f"1/7/30天评估样本 {target_evaluated} 条，低于 {min_samples} 条门槛。")
+    if missing_target_horizons:
+        reasons.append(f"以下短周期 horizon 尚无评估样本：{missing_target_horizons}。")
+    if total_due:
+        reasons.append(f"有 {total_due} 条到期预测尚未评估，需先补评估。")
+    can_evolve = not reasons
+    if can_evolve:
+        reasons.append("短周期样本条件满足，可生成并评估候选模型。")
+    return {
+        "target_horizons": target_horizons,
+        "evaluated_count": int(total_evaluated),
+        "due_pending_count": int(total_due),
+        "future_pending_count": int(total_future),
+        "target_evaluated_count": int(target_evaluated),
+        "by_horizon": [by_horizon[key] for key in sorted(by_horizon)],
+        "can_evolve": can_evolve,
+        "cannot_evolve_reasons": [] if can_evolve else reasons,
+        "message": reasons[0] if reasons else "短周期样本条件满足。",
     }
 
 
@@ -563,21 +717,32 @@ def _sample_prediction_params(n_iter: int, random_seed: int = 42) -> list[dict[s
     return samples
 
 
-def _score_prediction_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _score_prediction_metrics(
+    metrics: dict[str, dict[str, Any]],
+    target_horizons: list[int] | None = None,
+) -> dict[str, Any]:
+    target_horizons = target_horizons or EVOLUTION_HORIZONS
+    target_keys = {str(item) for item in target_horizons}
     weighted_mape = 0.0
     weighted_mae = 0.0
     weighted_direction = 0.0
+    weighted_recent_direction = 0.0
     used_weight = 0.0
     valid_horizons = 0
     total_samples = 0
+    horizon_details: dict[str, dict[str, Any]] = {}
 
     for horizon, weight in OPTIMIZATION_HORIZON_WEIGHTS.items():
+        if horizon not in target_keys:
+            continue
         row = metrics.get(horizon, {})
+        horizon_details[horizon] = row
         if not row.get("ok"):
             continue
         mape = row.get("mape_price_pct")
         mae = row.get("mae_price")
         direction = row.get("direction_accuracy")
+        recent_direction = row.get("recent_direction_accuracy")
         sample_count = int(row.get("sample_count") or 0)
         if mape is None or mae is None or direction is None or sample_count <= 0:
             continue
@@ -587,6 +752,7 @@ def _score_prediction_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, A
         weighted_mape += float(mape) * w
         weighted_mae += float(mae) * w
         weighted_direction += float(direction) * w
+        weighted_recent_direction += float(recent_direction if recent_direction is not None else direction) * w
         used_weight += w
         valid_horizons += 1
         total_samples += sample_count
@@ -598,11 +764,14 @@ def _score_prediction_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, A
             "reason": "no valid horizon metrics",
             "valid_horizons": 0,
             "sample_count": 0,
+            "target_horizons": target_horizons,
+            "horizon_metrics": horizon_details,
         }
 
     avg_mape = weighted_mape / used_weight
     avg_mae = weighted_mae / used_weight
     avg_direction = weighted_direction / used_weight
+    avg_recent_direction = weighted_recent_direction / used_weight
     # 分数越高越好：方向准确率加分，MAPE 扣分。MAE 用于展示和次级排序。
     optimization_score = avg_direction * 100 - avg_mape * 2
     return {
@@ -611,8 +780,11 @@ def _score_prediction_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, A
         "weighted_mape_price_pct": round(float(avg_mape), 4),
         "weighted_mae_price": round(float(avg_mae), 4),
         "weighted_direction_accuracy": round(float(avg_direction), 4),
+        "weighted_recent_direction_accuracy": round(float(avg_recent_direction), 4),
         "valid_horizons": valid_horizons,
         "sample_count": total_samples,
+        "target_horizons": target_horizons,
+        "horizon_metrics": horizon_details,
     }
 
 
@@ -624,6 +796,7 @@ def optimize_prediction_model_params(
     save_best: bool = True,
     auto_activate: bool = False,
     activation_thresholds: dict[str, float | int] | None = None,
+    target_horizons: list[int] | None = None,
 ) -> dict[str, Any]:
     """生成候选预测模型参数，并用 walk-forward 多 horizon 指标排序。
 
@@ -635,11 +808,12 @@ def optimize_prediction_model_params(
 
     merged = context["merged"]
     gold_idx = context["gold_idx"]
+    target_horizons = target_horizons or EVOLUTION_HORIZONS
     candidates = _sample_prediction_params(n_iter=n_iter, random_seed=random_seed)
     results: list[dict[str, Any]] = []
     for index, params in enumerate(candidates):
         metrics = _walk_forward_evaluation(merged, gold_idx, params)
-        scored = _score_prediction_metrics(metrics)
+        scored = _score_prediction_metrics(metrics, target_horizons=target_horizons)
         label = "baseline" if index == 0 else f"candidate_{index}"
         results.append({
             "label": label,
@@ -671,15 +845,33 @@ def optimize_prediction_model_params(
     if save_best and best and best.get("ok"):
         saved = save_prediction_model_candidate(db, best)
         saved_version = saved.version
-        activation = prediction_model_activation_decision(best, activation_thresholds)
+        activation = prediction_model_activation_decision(best, baseline, activation_thresholds)
         activation["auto_activate_requested"] = bool(auto_activate)
         if auto_activate and activation["eligible"]:
+            previous = _active_prediction_model(db)
             activate_prediction_model_version(db, saved.version)
+            _record_model_audit(
+                db,
+                action="activate",
+                from_version=previous.version if previous else None,
+                to_version=saved.version,
+                operator="auto_optimizer",
+                reason="自动激活预测候选：短周期方向命中率、baseline提升、近期窗口、MAPE和过拟合门控均通过。",
+                metrics={"candidate": _compact_optimization_result(best), "baseline": _compact_optimization_result(baseline), "activation": activation},
+            )
             activation["activated"] = True
             activation["activated_version"] = saved.version
 
+    if not best:
+        reason = "优化失败：未产生任何候选结果"
+    elif not best.get("ok"):
+        reason = best.get("reason") or "所有候选模型均未通过 horizon 评估（数据量不足或评估指标无效）"
+    else:
+        reason = None
+
     return {
         "ok": bool(best and best.get("ok")),
+        "target_horizons": target_horizons,
         "saved_version": saved_version,
         "activation": activation,
         "best": _compact_optimization_result(best) if best else None,
@@ -689,11 +881,13 @@ def optimize_prediction_model_params(
             f"Saved candidate model {saved_version}. Activate manually after review."
             if saved_version else "Optimization completed without saving a candidate."
         ),
+        "reason": reason,
     }
 
 
 def prediction_model_activation_decision(
     result: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
     thresholds: dict[str, float | int] | None = None,
 ) -> dict[str, Any]:
     thresholds = thresholds or {}
@@ -701,7 +895,10 @@ def prediction_model_activation_decision(
     max_mape = float(thresholds.get("max_mape_price_pct", 8.0))
     min_direction = float(thresholds.get("min_direction_accuracy", 0.52))
     min_samples = int(thresholds.get("min_samples", 120))
-    min_valid_horizons = int(thresholds.get("min_valid_horizons", 4))
+    min_valid_horizons = int(thresholds.get("min_valid_horizons", len(EVOLUTION_HORIZONS)))
+    min_baseline_lift = float(thresholds.get("min_baseline_lift", 0.03))
+    max_mape_worse_ratio = float(thresholds.get("max_mape_worse_ratio", 1.2))
+    max_recent_degradation = float(thresholds.get("max_recent_degradation", 0.05))
 
     checks = [
         ("optimization_score", result.get("optimization_score"), ">=", min_score),
@@ -721,19 +918,96 @@ def prediction_model_activation_decision(
         if not passed:
             eligible = False
             reasons.append(f"{name} {value} not {op} {threshold}")
+
+    target_horizons = [int(item) for item in result.get("target_horizons") or EVOLUTION_HORIZONS]
+    horizon_metrics = result.get("horizon_metrics") or {}
+    missing_horizons = [
+        horizon for horizon in target_horizons
+        if not (horizon_metrics.get(str(horizon), {}).get("ok") and int(horizon_metrics.get(str(horizon), {}).get("sample_count") or 0) > 0)
+    ]
+    if missing_horizons:
+        eligible = False
+        reasons.append(f"missing valid horizon samples: {missing_horizons}")
+
+    baseline_direction = baseline.get("weighted_direction_accuracy") if baseline else None
+    baseline_mape = baseline.get("weighted_mape_price_pct") if baseline else None
+    direction = result.get("weighted_direction_accuracy")
+    mape = result.get("weighted_mape_price_pct")
+    baseline_lift = None
+    if baseline_direction is None or direction is None:
+        eligible = False
+        reasons.append("baseline direction comparison missing")
+    else:
+        baseline_lift = round(float(direction) - float(baseline_direction), 4)
+        if baseline_lift < min_baseline_lift:
+            eligible = False
+            reasons.append(f"baseline_lift {baseline_lift} < {min_baseline_lift}")
+
+    if baseline_mape is not None and mape is not None and float(mape) > float(baseline_mape) * max_mape_worse_ratio:
+        eligible = False
+        reasons.append(f"candidate MAPE {mape} worsens baseline {baseline_mape} by > {max_mape_worse_ratio:.1f}x")
+
+    recent_direction = result.get("weighted_recent_direction_accuracy")
+    if recent_direction is not None and direction is not None and float(recent_direction) + max_recent_degradation < float(direction):
+        eligible = False
+        reasons.append("recent direction accuracy degraded materially")
+
+    overfit_risk = prediction_model_overfit_risk(result, baseline)
+    if overfit_risk["level"] == "high":
+        eligible = False
+        reasons.append("overfit risk is high")
+
     if eligible:
         reasons.append("all thresholds passed")
     return {
         "eligible": eligible,
         "activated": False,
         "reasons": reasons,
+        "baseline_lift": baseline_lift,
+        "overfit_risk": overfit_risk,
         "thresholds": {
             "min_score": min_score,
             "max_mape_price_pct": max_mape,
             "min_direction_accuracy": min_direction,
             "min_samples": min_samples,
             "min_valid_horizons": min_valid_horizons,
+            "min_baseline_lift": min_baseline_lift,
+            "max_mape_worse_ratio": max_mape_worse_ratio,
+            "max_recent_degradation": max_recent_degradation,
         },
+    }
+
+
+def prediction_model_overfit_risk(
+    result: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    direction = result.get("weighted_direction_accuracy")
+    recent = result.get("weighted_recent_direction_accuracy")
+    baseline_direction = baseline.get("weighted_direction_accuracy") if baseline else None
+    sample_count = int(result.get("sample_count") or 0)
+    valid_horizons = int(result.get("valid_horizons") or 0)
+    if direction is not None and float(direction) >= 0.90:
+        warnings.append("短周期方向命中率高于 90%，需要警惕过拟合。")
+    if direction is not None and baseline_direction is not None and float(direction) - float(baseline_direction) >= 0.25:
+        warnings.append("相对 baseline 提升超过 25 个百分点，可能由样本区间偏差造成。")
+    if recent is not None and direction is not None and float(recent) + 0.05 < float(direction):
+        warnings.append("近期窗口表现弱于总体表现，存在退化迹象。")
+    if sample_count < 120:
+        warnings.append("短周期总评估样本不足 120。")
+    if valid_horizons < len(EVOLUTION_HORIZONS):
+        warnings.append("1/7/30 天 horizon 尚未全部形成有效评估。")
+
+    level = "low"
+    if len(warnings) >= 2:
+        level = "high"
+    elif warnings:
+        level = "medium"
+    return {
+        "level": level,
+        "warnings": warnings or ["未触发明显过拟合警告。"],
+        "not_recommended_for_auto_activation": level == "high",
     }
 
 
@@ -751,6 +1025,99 @@ def activate_prediction_model_version(db: Session, version: str) -> PredictionMo
     return target
 
 
+def rollback_degraded_prediction_model(
+    db: Session,
+    observation_limit: int = 30,
+    observation_days: int = 14,
+    min_observations: int = 5,
+) -> dict[str, Any]:
+    """若当前预测模型近期表现退化，则自动回滚到上一稳定版本。"""
+    active = _active_prediction_model(db)
+    if active.version == DEFAULT_MODEL_VERSION:
+        return {"ok": True, "rolled_back": False, "reason": "active model is baseline"}
+
+    cutoff = utc_now().replace(tzinfo=None) - timedelta(days=observation_days)
+    active_rows = db.scalars(
+        select(GoldPredictionEvaluation)
+        .where(
+            GoldPredictionEvaluation.model_version == active.version,
+            GoldPredictionEvaluation.evaluated_at >= cutoff,
+        )
+        .order_by(GoldPredictionEvaluation.evaluated_at.desc())
+        .limit(observation_limit)
+    ).all()
+    if len(active_rows) < min_observations:
+        return {
+            "ok": True,
+            "rolled_back": False,
+            "reason": f"active model observation samples {len(active_rows)} < {min_observations}",
+        }
+
+    active_accuracy = float(np.mean([1.0 if row.direction_hit else 0.0 for row in active_rows]))
+    baseline_rows = db.scalars(
+        select(GoldPredictionEvaluation)
+        .where(GoldPredictionEvaluation.model_version == DEFAULT_MODEL_VERSION)
+        .order_by(GoldPredictionEvaluation.evaluated_at.desc())
+        .limit(observation_limit)
+    ).all()
+    baseline_accuracy = (
+        float(np.mean([1.0 if row.direction_hit else 0.0 for row in baseline_rows]))
+        if baseline_rows
+        else None
+    )
+    stored_accuracy = active.direction_accuracy
+    reasons: list[str] = []
+    if baseline_accuracy is not None and active_accuracy < baseline_accuracy:
+        reasons.append(f"active_recent_accuracy {active_accuracy:.3f} < baseline_recent_accuracy {baseline_accuracy:.3f}")
+    if stored_accuracy is not None and active_accuracy + 0.05 < float(stored_accuracy):
+        reasons.append(f"active_recent_accuracy {active_accuracy:.3f} degraded from stored_accuracy {float(stored_accuracy):.3f}")
+    if not reasons:
+        return {
+            "ok": True,
+            "rolled_back": False,
+            "active_accuracy": round(active_accuracy, 4),
+            "baseline_accuracy": round(baseline_accuracy, 4) if baseline_accuracy is not None else None,
+            "reason": "active model performance is within rollback guardrails",
+        }
+
+    previous_audit = db.scalar(
+        select(ModelActivationAudit)
+        .where(
+            ModelActivationAudit.model_type == "prediction",
+            ModelActivationAudit.action == "activate",
+            ModelActivationAudit.to_version == active.version,
+        )
+        .order_by(ModelActivationAudit.created_at.desc())
+    )
+    rollback_version = previous_audit.from_version if previous_audit and previous_audit.from_version else DEFAULT_MODEL_VERSION
+    target = activate_prediction_model_version(db, rollback_version)
+    if target is None:
+        target = activate_prediction_model_version(db, DEFAULT_MODEL_VERSION)
+        rollback_version = DEFAULT_MODEL_VERSION
+    audit = _record_model_audit(
+        db,
+        action="rollback",
+        from_version=active.version,
+        to_version=rollback_version,
+        operator="auto_rollback",
+        reason="；".join(reasons),
+        metrics={
+            "active_accuracy": round(active_accuracy, 4),
+            "baseline_accuracy": round(baseline_accuracy, 4) if baseline_accuracy is not None else None,
+            "stored_accuracy": stored_accuracy,
+            "observation_count": len(active_rows),
+        },
+    )
+    return {
+        "ok": True,
+        "rolled_back": True,
+        "from_version": active.version,
+        "to_version": rollback_version,
+        "audit_id": audit.id,
+        "reasons": reasons,
+    }
+
+
 def _compact_optimization_result(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if item is None:
         return None
@@ -761,8 +1128,11 @@ def _compact_optimization_result(item: dict[str, Any] | None) -> dict[str, Any] 
         "weighted_mape_price_pct": item.get("weighted_mape_price_pct"),
         "weighted_mae_price": item.get("weighted_mae_price"),
         "weighted_direction_accuracy": item.get("weighted_direction_accuracy"),
+        "weighted_recent_direction_accuracy": item.get("weighted_recent_direction_accuracy"),
         "valid_horizons": item.get("valid_horizons"),
         "sample_count": item.get("sample_count"),
+        "target_horizons": item.get("target_horizons"),
+        "horizon_metrics": item.get("horizon_metrics"),
         "params": item.get("params"),
     }
 
@@ -782,7 +1152,7 @@ def save_prediction_model_candidate(db: Session, result: dict[str, Any]) -> Pred
         direction_accuracy=result.get("weighted_direction_accuracy"),
         evaluated_count=int(result.get("sample_count") or 0),
         notes=(
-            "候选预测模型，基于多 horizon walk-forward 自动搜索生成；"
+            "候选预测模型，基于 1/7/30 天短周期方向命中率 walk-forward 自动搜索生成；"
             f"score={result.get('optimization_score')}, "
             f"valid_horizons={result.get('valid_horizons')}。默认不自动激活。"
         ),
@@ -877,6 +1247,12 @@ def _walk_forward_evaluation(
         actual_direction = np.where(np.abs(actual) < 0.25, 0, np.sign(actual))
         predicted_direction = np.where(np.abs(pred) < 0.25, 0, np.sign(pred))
         direction_accuracy = float((predicted_direction == actual_direction).mean()) if len(actual) else 0.0
+        recent_count = min(30, max(1, len(actual) // 3)) if len(actual) else 0
+        recent_direction_accuracy = (
+            float((predicted_direction[-recent_count:] == actual_direction[-recent_count:]).mean())
+            if recent_count
+            else None
+        )
         out[str(horizon)] = {
             "ok": True,
             "evaluation_method": f"walk_forward_step_{eval_step}d_with_0.25pct_deadband",
@@ -890,6 +1266,9 @@ def _walk_forward_evaluation(
             if nonzero_mask.any()
             else None,
             "direction_accuracy": round(direction_accuracy, 4),
+            "recent_direction_accuracy": round(recent_direction_accuracy, 4)
+            if recent_direction_accuracy is not None
+            else None,
         }
     return out
 
@@ -917,9 +1296,12 @@ def _short_term_predict(
         momentum = 0
         price_start = price_end = current_price
 
-    # 2) 评分信号：score_similarity 加权
+    # 2) 评分信号：score_similarity 加权（短 horizon 用更窄的 sigma 聚焦当前评分）
     if n >= 10:
-        sigma = max(1.0, _param(params, "score_similarity_sigma"))
+        base_sigma = max(1.0, _param(params, "score_similarity_sigma"))
+        # 缩放: 1d→0.5x, 7d→0.75x, 30d→1.0x
+        horizon_scale = min(1.0, max(0.5, horizon / 30.0))
+        sigma = base_sigma * horizon_scale
         weights = np.exp(-((df["score"] - current_score) ** 2) / (2 * sigma**2))
         expected_ret = float(np.average(df["return_pct"], weights=weights))
         std_ret = float(df["return_pct"].std())
@@ -1044,7 +1426,7 @@ def _long_term_predict(
             lines.append(f"● CFTC 净多占比 {cftc_net:.0%}（中性）")
 
     # 计算预期收益
-    annual_base = _param(params, "long_annual_base_return_pct")
+    annual_base = min(_param(params, "long_annual_base_return_pct"), 5.0)
     base_ret = annual_base * (horizon / 365)
     macro_scale = _param(params, "long_macro_adjustment_scale")
     macro_adj = macro_score * macro_scale * (horizon / 90)

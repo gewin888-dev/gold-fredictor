@@ -58,7 +58,6 @@ def collect_central_bank_gold(db: Session) -> int:
                 db, code, period, ts, net, "WGC", now, reserves.get(code)
             )
 
-    db.commit()
     return count
 
 

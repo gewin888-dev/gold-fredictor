@@ -528,10 +528,18 @@ def get_cftc() -> pd.DataFrame:
     db = SessionLocal()
     try:
         rows = db.scalars(select(CftcPosition).order_by(CftcPosition.timestamp.asc())).all()
-        return pd.DataFrame([{
-            "时间": r.timestamp, "净多": r.noncommercial_net,
-            "多": r.noncommercial_long, "空": r.noncommercial_short,
-        } for r in rows])
+        data = []
+        for r in rows:
+            net_ratio = r.noncommercial_net / r.open_interest * 100 if r.open_interest > 0 else 0
+            data.append({
+                "时间": r.timestamp,
+                "净多": r.noncommercial_net,
+                "多": r.noncommercial_long,
+                "空": r.noncommercial_short,
+                "净多占比%": round(net_ratio, 1),
+                "总持仓": r.open_interest,
+            })
+        return pd.DataFrame(data)
     finally:
         db.close()
 
@@ -643,10 +651,11 @@ def get_cb_gold() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 @st.cache_data(ttl=55)
-def get_sentiment() -> tuple[float | None, pd.DataFrame]:
+def get_sentiment() -> tuple[float | None, pd.DataFrame, list[dict]]:
     db = SessionLocal()
     try:
         from app.models import NewsSentiment
+        from app.data.sentiment_collector import get_daily_sentiment_trend
         rows = db.scalars(
             select(NewsSentiment)
             .where(NewsSentiment.source.in_(["GDELT", "NEWSAPI"]))
@@ -659,7 +668,8 @@ def get_sentiment() -> tuple[float | None, pd.DataFrame]:
             "数据源": r.source,
         } for r in rows])
         latest_score = float(rows[0].sentiment_score) if rows else None
-        return latest_score, df
+        daily_trend = get_daily_sentiment_trend(db, days=30)
+        return latest_score, df, daily_trend
     finally:
         db.close()
 
@@ -900,7 +910,7 @@ try:
         status_icon = {"healthy": "✅", "degraded": "⚠️", "critical": "🔴", "initializing": "🔄"}.get(overall, "❓")
         status_label = f"{status_icon} 系统健康：{healthy}/{total} 采集器正常"
 
-        with st.expander(status_label, expanded=(overall != "healthy")):
+        with st.expander(status_label, expanded=False):
             # 每个采集器状态
             for c in collector_health.get("collectors", []):
                 s_icon = {"healthy": "✅", "degraded": "⚠️", "stale": "🕐", "no_data": "❌"}.get(c["status"], "❓")
@@ -1564,38 +1574,67 @@ if pred.get("ok"):
 
         cols = st.columns(len(preds))
         for i, p in enumerate(preds):
-            icon = "🟢" if p.get("return_pct", 0) > 0 else "🔴"
-            rel = p.get("reliability", 0.5)
+            samples = p.get("samples", 0)
+            no_data = samples == 0
+            rel = p.get("reliability", 0) if not no_data else 0
             note = p.get("note", "")
             low = p.get("low", 0)
             high = p.get("high", 0)
-            color = "#16a34a" if p.get("return_pct", 0) > 0 else "#dc2626"
+            return_pct = p.get("return_pct", 0)
+            icon = "🟢" if return_pct > 0 else "🔴"
+            color = "#16a34a" if return_pct > 0 else "#dc2626"
+            predicted = p.get("predicted", 0)
 
             note_html = html.escape(note).replace("\n", "<br>") if note else "暂无详情"
 
-            with cols[i]:
-                tip_class = ""
-                if i == 0:
-                    tip_class = " pred-tip-left"
-                elif i == len(preds) - 1:
-                    tip_class = " pred-tip-right"
+            # tip_class 提前计算，no_data 和正常分支共用
+            tip_class = ""
+            if i == 0:
+                tip_class = " pred-tip-left"
+            elif i == len(preds) - 1:
+                tip_class = " pred-tip-right"
 
-                st.markdown(f"""
+            with cols[i]:
+                if no_data:
+                    st.markdown(f"""
+                <div class="pred-wrap">
+                  <div class="pred-card" tabindex="0" style="opacity:0.55">
+                    <h4>{p.get('horizon', '?')}</h4>
+                    <span class="price" style="color:#94a3b8">数据不足</span>
+                    <div class="confidence" style="background:#fef3c7;color:#92400e">缺少历史数据</div>
+                  </div>
+                  <div class="pred-tip{tip_class}">
+                    <table><tr>
+                    <td>
+                      <div class="th">预测价格</div><div class="h1" style="color:#94a3b8">数据不足</div>
+                      <div class="th">原因</div><div class="h3">评分历史数据不足，无法评估 {p.get('horizon', '?')} 期限的预测准确率。</div>
+                      <div class="th">样本量</div><div class="h3">{samples} 条</div>
+                    </td>
+                    <td>
+                      <div class="th">预测理由</div>
+                      <div class="h3">积累更多评分快照后（约需 7 天以上历史），系统将自动补全短周期预测。</div>
+                    </td>
+                    </tr></table>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
                 <div class="pred-wrap">
                   <div class="pred-card" tabindex="0">
                     <h4>{p.get('horizon', '?')}</h4>
-                    <span class="price">${p.get('predicted', 0):,.0f}</span>
-                    <span class="delta" style="color:{color}">{icon} {p.get('return_pct', 0):+.1f}%</span>
+                    <span class="price">${predicted:,.0f}</span>
+                    <span class="delta" style="color:{color}">{icon} {return_pct:+.1f}%</span>
                     <div class="range">${low:,.0f} — ${high:,.0f}</div>
                     <div class="confidence">置信度 {rel:.0%}</div>
                   </div>
                   <div class="pred-tip{tip_class}">
                     <table><tr>
                     <td>
-                      <div class="th">预测价格</div><div class="h1">${p.get('predicted', 0):,.0f}</div>
-                      <div class="th">预期收益 · 置信度</div><div class="h2" style="color:{color}">{icon} {p.get('return_pct', 0):+.1f}% · {rel:.0%}</div>
+                      <div class="th">预测价格</div><div class="h1">${predicted:,.0f}</div>
+                      <div class="th">预期收益 · 置信度</div><div class="h2" style="color:{color}">{icon} {return_pct:+.1f}% · {rel:.0%}</div>
                       <div class="th">波动区间</div><div class="h3">${low:,.0f} — ${high:,.0f}</div>
-                      <div class="th">样本量</div><div class="h3">{p.get('samples', 0)} 条</div>
+                      <div class="th">样本量</div><div class="h3">{samples} 条</div>
                     </td>
                     <td>
                       <div class="th">预测理由</div>
@@ -1608,41 +1647,43 @@ if pred.get("ok"):
 
     st.markdown("<div style='height:54px'></div>", unsafe_allow_html=True)
 
-    # 预测曲线图
+    # 预测曲线图 — 仅包含有数据的预测
     if current and preds:
         import plotly.graph_objects as go
-        horizons = [p["horizon"] for p in preds]
-        pred_prices = [p["predicted"] for p in preds]
-        lows = [p["low"] for p in preds]
-        highs = [p["high"] for p in preds]
+        valid_preds = [p for p in preds if p.get("samples", 0) > 0]
+        if not valid_preds:
+            pass
+        else:
+            horizons = [p["horizon"] for p in valid_preds]
+            pred_prices = [p["predicted"] for p in valid_preds]
+            lows = [p["low"] for p in valid_preds]
+            highs = [p["high"] for p in valid_preds]
 
-        x_labels = ["当前"] + horizons
-        y_vals = [current] + pred_prices
-        y_low = [current] + lows
-        y_high = [current] + highs
+            x_labels = ["当前"] + horizons
+            y_vals = [current] + pred_prices
+            y_low = [current] + lows
+            y_high = [current] + highs
 
-        fig_p = go.Figure()
-        # 置信区间填充
-        fig_p.add_trace(go.Scatter(
-            x=x_labels + x_labels[::-1],
-            y=y_high + y_low[::-1],
-            fill="toself", fillcolor="rgba(240,185,11,0.15)",
-            line=dict(width=0), showlegend=False, hoverinfo="skip",
-        ))
-        # 预测线
-        fig_p.add_trace(go.Scatter(
-            x=x_labels, y=y_vals, mode="lines+markers",
-            line=dict(color="#f0b90b", width=1.5), marker=dict(size=6),
-            hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>",
-        ))
-        fig_p.update_layout(
-            **PLOTLY_LIGHT_LAYOUT,
-            height=300, margin=dict(l=0,r=0,t=0,b=20),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
-            hovermode="x unified", showlegend=False
-        )
-        st.plotly_chart(fig_p, use_container_width=True)
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Scatter(
+                x=x_labels + x_labels[::-1],
+                y=y_high + y_low[::-1],
+                fill="toself", fillcolor="rgba(240,185,11,0.15)",
+                line=dict(width=0), showlegend=False, hoverinfo="skip",
+            ))
+            fig_p.add_trace(go.Scatter(
+                x=x_labels, y=y_vals, mode="lines+markers",
+                line=dict(color="#f0b90b", width=1.5), marker=dict(size=6),
+                hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>",
+            ))
+            fig_p.update_layout(
+                **PLOTLY_LIGHT_LAYOUT,
+                height=300, margin=dict(l=0,r=0,t=0,b=20),
+                xaxis=dict(showgrid=False),
+                yaxis=dict(title=None, showgrid=True, gridcolor="#f1f5f9"),
+                hovermode="x unified", showlegend=False
+            )
+            st.plotly_chart(fig_p, use_container_width=True)
 
         with st.expander("预测理论与理由", expanded=False):
             st.caption(
@@ -1650,6 +1691,12 @@ if pred.get("ok"):
                 f"  UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M')}"
             )
             for p in preds:
+                if p.get("samples", 0) == 0:
+                    st.markdown(
+                        f"**{p.get('horizon', '?')} · ⚠️ 数据不足**  \\n"
+                        f"评分历史数据尚不够长，无法评估该期限的预测准确率。积累更多数据后自动补全。"
+                    )
+                    continue
                 note = p.get("note") or "暂无预测理由。"
                 err = p.get("error_metrics") or {}
                 err_text = ""
@@ -1660,7 +1707,7 @@ if pred.get("ok"):
                         f"方向准确率 {err.get('direction_accuracy', 0):.0%}。"
                     )
                 st.markdown(
-                    f"**{p.get('horizon', '?')} · 可靠性{p.get('reliability_label', '低')}**  \n"
+                    f"**{p.get('horizon', '?')} · 可靠性{p.get('reliability_label', '低')}**  \\n"
                     f"预测价 `${p.get('predicted', 0):,.0f}`，"
                     f"预期收益 `{p.get('return_pct', 0):+.1f}%`，"
                     f"区间 `${p.get('low', 0):,.0f} - ${p.get('high', 0):,.0f}`。"
@@ -1986,7 +2033,7 @@ else:
 st.divider()
 st.markdown('<a id="news-sentiment"></a>', unsafe_allow_html=True)
 st.subheader("新闻情绪")
-sent_score, sent_df = get_sentiment()
+sent_score, sent_df, _ = get_sentiment()
 st.caption(f"生产新闻源：NewsAPI（每日限额 {SETTINGS.newsapi_daily_limit} 次）；兼容展示 GDELT。密钥来自 .env，不在页面暴露。")
 if sent_score is not None:
     sent_icon = "🟢" if sent_score > 0 else "🔴"
