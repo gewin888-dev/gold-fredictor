@@ -747,21 +747,13 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
-    # 💬 AI 对话开关
+    # 💬 AI 助手 — 独立窗口打开
     st.markdown("### 💬 AI 助手")
-    if "show_ai_chat" not in st.session_state:
-        st.session_state.show_ai_chat = False
-    show_chat = st.toggle("打开 AI 对话窗口", value=st.session_state.show_ai_chat,
-                          help="点击后在主区域上方打开 AI 对话悬浮窗口，可输入地缘事件/系统维护问题")
-    if show_chat != st.session_state.show_ai_chat:
-        st.session_state.show_ai_chat = show_chat
-        st.rerun()
-    # 独立窗口快捷入口
     st.markdown(
         '<a href="http://127.0.0.1:8000/ai/ui" target="_blank" style="text-decoration:none">'
         '<button style="width:100%;padding:8px;background:#334155;border:none;border-radius:6px;'
-        'color:#e2e8f0;font-size:13px;cursor:pointer;margin-top:4px">'
-        '🔗 打开独立窗口</button></a>',
+        'color:#e2e8f0;font-size:13px;cursor:pointer">'
+        '🔗 打开 AI 对话窗口</button></a>',
         unsafe_allow_html=True,
     )
     st.divider()
@@ -1129,175 +1121,11 @@ if gold.get("ok") and gold.get("price"):
 else:
     st.warning("实时金价暂时无法获取。")
 
-# ═══════════════════════════════════════════
-# 💬 AI 对话悬浮窗口（侧边栏开关控制）
-# ═══════════════════════════════════════════
-
-if st.session_state.get("show_ai_chat"):
-    with st.container():
-        st.markdown("""
-        <style>
-        .ai-chat-panel {
-            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-            border: 1px solid #334155;
-            border-radius: 12px;
-            padding: 0;
-            margin: 8px 0 16px 0;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-        }
-        .ai-chat-header {
-            background: rgba(59,130,246,0.15);
-            padding: 10px 16px;
-            border-radius: 12px 12px 0 0;
-            border-bottom: 1px solid #1e3a5f;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .ai-chat-body {
-            padding: 12px 16px;
-            max-height: 480px;
-            overflow-y: auto;
-        }
-        .ai-chat-msg-user {
-            background: rgba(59,130,246,0.12);
-            border-left: 3px solid #3b82f6;
-            padding: 8px 12px;
-            border-radius: 0 6px 6px 0;
-            margin: 6px 0;
-            color: #e2e8f0;
-            font-size: 0.88rem;
-        }
-        .ai-chat-msg-assistant {
-            background: rgba(148,163,184,0.06);
-            border-left: 3px solid #64748b;
-            padding: 8px 12px;
-            border-radius: 0 6px 6px 0;
-            margin: 6px 0;
-            color: #cbd5e1;
-            font-size: 0.86rem;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-        st.markdown('<div class="ai-chat-panel">', unsafe_allow_html=True)
-
-        # Header
-        ch1, ch2 = st.columns([10, 1])
-        with ch1:
-            st.markdown('### 💬 AI 助手（对话窗口）')
-        with ch2:
-            if st.button("✕", key="close_ai_chat", help="关闭对话窗口"):
-                st.session_state.show_ai_chat = False
-                st.rerun()
-
-        st.caption("输入地缘事件、宏观变化或系统维护问题，AI 结合当前数据给出分析。")
-
-        # Init messages
-        if "ai_chat_msgs" not in st.session_state:
-            st.session_state.ai_chat_msgs = []
-            try:
-                hist = api("/ai/chat/history", params={"session_id": "dashboard"})
-                if hist.get("ok") and hist.get("messages"):
-                    st.session_state.ai_chat_msgs = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in hist["messages"]
-                    ]
-            except Exception:
-                pass
-
-        # Messages display
-        chat_body = '<div class="ai-chat-body">'
-        for msg in st.session_state.ai_chat_msgs[-20:]:
-            cls = "ai-chat-msg-user" if msg["role"] == "user" else "ai-chat-msg-assistant"
-            label = "👤" if msg["role"] == "user" else "🤖"
-            safe_content = html.escape(msg["content"]).replace("\n", "<br>")
-            chat_body += f'<div class="{cls}"><strong>{label}</strong> {safe_content}</div>'
-        chat_body += '</div>'
-        st.markdown(chat_body, unsafe_allow_html=True)
-
-        # Input
-        prompt = st.chat_input("输入事件或问题…", key="ai_chat_panel_input")
-        if prompt:
-            st.session_state.ai_chat_msgs.append({"role": "user", "content": prompt})
-            with st.spinner("AI 分析中…"):
-                try:
-                    resp = api("/ai/chat", "post", json={"message": prompt, "session_id": "dashboard"})
-                    if resp.get("ok"):
-                        reply = resp.get("reply", "（无回复）")
-                        st.session_state.ai_chat_msgs.append({"role": "assistant", "content": reply})
-                    else:
-                        st.session_state.ai_chat_msgs.append(
-                            {"role": "assistant", "content": f"对话失败：{resp.get('reply', '未知错误')}"}
-                        )
-                except Exception as e:
-                    st.session_state.ai_chat_msgs.append({"role": "assistant", "content": f"连接失败：{e}"})
-            st.rerun()
-
-        # Controls
-        cc1, cc2, cc3 = st.columns([1, 1, 3])
-        with cc1:
-            if st.button("🗑️ 清空", key="ai_chat_clear", use_container_width=True):
-                try:
-                    api("/ai/chat/reset", "post", params={"session_id": "dashboard"})
-                except Exception:
-                    pass
-                st.session_state.ai_chat_msgs = []
-                st.rerun()
-        with cc2:
-            if st.button("📋 归档", key="ai_chat_archive_btn", use_container_width=True):
-                st.session_state.show_ai_archive = not st.session_state.get("show_ai_archive", False)
-                st.rerun()
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # 归档面板
-    if st.session_state.get("show_ai_archive"):
-        with st.container():
-            st.markdown("#### 📋 对话归档")
-            try:
-                archive = api("/ai/chat/archive")
-                if archive.get("ok"):
-                    sessions = archive.get("sessions", [])
-                    if sessions:
-                        for s in sessions[:20]:
-                            sid = s.get("session_id", "")
-                            title = s.get("title", "")[:40]
-                            count = s.get("message_count", 0)
-                            updated = s.get("updated_at", "")[:16]
-
-                            sc1, sc2, sc3 = st.columns([6, 2, 1])
-                            with sc1:
-                                st.caption(f"**{title}** · {count}条消息 · {updated}")
-                            with sc2:
-                                if st.button("查看", key=f"view_{sid}"):
-                                    st.session_state.view_session = sid
-                                    st.rerun()
-                            with sc3:
-                                if st.button("🗑", key=f"del_{sid}"):
-                                    api("delete", f"/ai/chat/archive/{sid}")
-                                    st.rerun()
-
-                        # 查看归档详情
-                        view_sid = st.session_state.get("view_session")
-                        if view_sid:
-                            detail = api(f"/ai/chat/archive/{view_sid}")
-                            if detail.get("ok"):
-                                with st.expander(f"📄 {view_sid} 详情", expanded=True):
-                                    for m in detail.get("messages", []):
-                                        role_label = "👤 用户" if m["role"] == "user" else "🤖 AI"
-                                        st.markdown(f"**{role_label}** ({m.get('created_at', '')[:16]})")
-                                        st.markdown(m["content"])
-                                        st.divider()
-                                    if st.button("关闭详情"):
-                                        st.session_state.view_session = None
-                                        st.rerun()
-                    else:
-                        st.caption("暂无归档对话")
-            except Exception as e:
-                st.caption(f"加载归档失败：{e}")
-
 st.divider()
+
+# ═══════════════════════════════════════════
+# 评分
+# ═══════════════════════════════════════════
 
 # ═══════════════════════════════════════════
 # 评分
