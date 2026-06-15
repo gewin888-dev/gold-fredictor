@@ -851,15 +851,28 @@ with st.expander(health_label, expanded=False):
     for reason in health_payload.get("reasons", []):
         st.caption(f"• {reason}")
 
-# ── 采集器健康 + AI 洞察 ──
+# ── 采集器健康 + AI 洞察（主动可查）──
 try:
     collector_health = api("/health/collectors")
     if collector_health.get("ok"):
         summary = collector_health.get("summary", {})
         critical_issues = summary.get("critical_issues", [])
-        if critical_issues or summary.get("overall") != "healthy":
-            issues_text = "、".join(critical_issues) if critical_issues else "无严重问题"
-            st.warning(f"⚠️ 采集器异常：{issues_text}（健康 {summary.get('healthy',0)}/{summary.get('total',0)}）")
+        healthy = summary.get("healthy", 0)
+        total = summary.get("total", 0)
+        overall = collector_health.get("overall", "healthy")
+        status_icon = {"healthy": "✅", "degraded": "⚠️", "critical": "🔴", "initializing": "🔄"}.get(overall, "❓")
+        status_label = f"{status_icon} 系统健康：{healthy}/{total} 采集器正常"
+
+        with st.expander(status_label, expanded=(overall != "healthy")):
+            # 每个采集器状态
+            for c in collector_health.get("collectors", []):
+                s_icon = {"healthy": "✅", "degraded": "⚠️", "stale": "🕐", "no_data": "❌"}.get(c["status"], "❓")
+                age = f"{c['age_hours']:.1f}h" if c.get("age_hours") is not None else "从未"
+                err = f" — {c['last_error'][:60]}" if c.get("last_error") else ""
+                st.caption(f"{s_icon} {c['label']}：{c['status']}（{age}）{err}")
+            if st.button("🔄 检查采集器", key="check_collectors_btn"):
+                api("/ai/action", "post", params={"action": "检查采集器"})
+                st.rerun()
 except Exception:
     pass
 
