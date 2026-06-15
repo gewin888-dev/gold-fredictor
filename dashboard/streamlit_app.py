@@ -2094,12 +2094,13 @@ with st.expander("评分模型自我进化", expanded=False):
                 st.caption("过拟合检查：" + "；".join(risk.get("warnings", [])))
             st.caption(detail.get("recommendation", ""))
 
-        audits = api("/models/activation-audit", params={"limit": 20})
-        if audits.get("ok") and audits.get("data"):
-            with st.expander("激活审计记录", expanded=False):
-                audit_df = pd.DataFrame(audits["data"])
-                show_cols = ["created_at", "model_type", "action", "from_version", "to_version", "operator", "reason"]
-                st.dataframe(audit_df[[c for c in show_cols if c in audit_df.columns]], use_container_width=True, hide_index=True)
+st.divider()
+audits = api("/models/activation-audit", params={"limit": 20})
+if audits.get("ok") and audits.get("data"):
+    with st.expander("激活审计记录", expanded=False):
+        audit_df = pd.DataFrame(audits["data"])
+        show_cols = ["created_at", "model_type", "action", "from_version", "to_version", "operator", "reason"]
+        st.dataframe(audit_df[[c for c in show_cols if c in audit_df.columns]], use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════
 # 底部状态
