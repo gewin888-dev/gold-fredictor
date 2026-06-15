@@ -1392,6 +1392,7 @@ if pred.get("ok"):
     st.caption(
         f"v2 多信号集成：模型 {pred.get('model_version', '—')}，训练源 {', '.join(pred.get('training_sources', []))}。"
         "短期动量+评分回归，长期宏观基准+调整。"
+        f"  UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M')}"
     )
     st.caption(
         f"预测闭环状态：已评估 {evaluated_count} 条，到期待评估 {due_pending_count} 条，"
@@ -1573,7 +1574,10 @@ if pred.get("ok"):
         st.plotly_chart(fig_p, use_container_width=True)
 
         with st.expander("预测理论与理由", expanded=False):
-            st.caption("当前点为真实价格；未来点为模型估计。以下内容自动随 /predict/gold 重新计算。")
+            st.caption(
+                "当前点为真实价格；未来点为模型估计。以下内容自动随 /predict/gold 重新计算。"
+                f"  UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M')}"
+            )
             for p in preds:
                 note = p.get("note") or "暂无预测理由。"
                 err = p.get("error_metrics") or {}
@@ -1598,7 +1602,9 @@ if pred.get("ok"):
         model_data = get_prediction_models()
         if eval_data.get("ok"):
             summary = eval_data.get("summary", {})
-            st.markdown("#### 预测验证闭环")
+            st.markdown(
+                f"#### 预测验证闭环  UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M')}"
+            )
             e1, e2, e3, e4, e5 = st.columns(5)
             e1.metric("已验证", f"{summary.get('evaluated_count', 0)} 条")
             e2.metric("待到期", f"{summary.get('future_pending_count', 0)} 条")
