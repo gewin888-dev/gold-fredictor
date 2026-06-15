@@ -58,7 +58,7 @@ def collect_news_sentiment(
     """从 NewsAPI 采集黄金相关新闻情绪并入库。"""
     settings = get_settings()
     if not settings.newsapi_key:
-        return 0
+        raise ValueError("NEWSAPI_KEY not configured in .env")
 
     from_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
     requested_records = max(1, min(max_records, settings.newsapi_daily_limit, 100))
@@ -134,10 +134,9 @@ def collect_news_sentiment(
             db.execute(stmt)
             count += 1
 
-        db.commit()
         return count
-    except Exception:
-        return 0
+    except requests.RequestException as e:
+        raise RuntimeError(f"NewsAPI request failed: {e}") from e
 
 
 def get_recent_sentiment(db: Session, days: int = 7) -> float | None:
