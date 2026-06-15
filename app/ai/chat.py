@@ -1,9 +1,11 @@
-"""AI 对话窗口 — DB持久化 + 归档 + 全系统深度融合。
+"""AI 对话窗口 — DB持久化 + 归档 + 全系统深度融合 + 主动智能化。
 
 特性：
 - 对话记录自动存入 SQLite（chat_sessions + chat_messages 表）
 - 支持多会话存档和回溯
 - AI 可访问全部系统数据：实时金价、评分、预测、宏观、CFTC、情绪等
+- 主动分析：预计算异常检测、交叉验证、数据质量预警
+- 自主操作：可触发评分重算、模型切换、数据采集等系统操作
 """
 
 from __future__ import annotations
@@ -27,10 +29,10 @@ from app.models import ChatMessage, ChatSession, GoldScoreSnapshot
 logger = logging.getLogger(__name__)
 
 API_TIMEOUT = 45
-API_MAX_TOKENS = 4096  # 增大以容纳更丰富的回复
+API_MAX_TOKENS = 4096
 API_TEMP = 0.5
 MAX_HISTORY_TURNS = 30
-CONTEXT_CACHE_TTL = 30  # 系统上下文缓存秒数
+CONTEXT_CACHE_TTL = 30
 
 _context_cache: dict = {}
 _context_cache_time: float = 0.0
@@ -38,38 +40,42 @@ _context_cache_time: float = 0.0
 
 # ==================== 系统提示词 ====================
 
-BASE_SYSTEM_PROMPT = """你是黄金走势监控与预测系统的 AI 助手，拥有对系统全部数据的访问权限。
+BASE_SYSTEM_PROMPT = """你是黄金走势监控与预测系统的 AI 助手和主动协驾员。
 
-你可以看到的数据和对应的分析能力：
+你拥有对系统全部数据的访问权限，并且能够主动分析、预警、建议操作。
 
-1. **实时金价** — COMEX 黄金期货 + 沪金连续实时报价、日内高低、涨跌幅
-2. **25 因子评分** — 多空评分总分、方向、短线/中期/长期因子贡献、完整因子分
-3. **价格预测** — 未来 1/7/30/90/180/360 天的金价预测及历史准确率
-4. **宏观指标** — 实际利率、名义利率、美元指数、VIX、通胀预期等最新值
-5. **CFTC 持仓** — 投机净多仓、商业净空仓、总持仓量
-6. **市场情绪** — 最新新闻情绪评分和标题
-7. **中国溢价** — 上海金对 COMEX 的溢价/折价
-8. **央行购金** — 各国央行月度购金数据
-9. **系统健康** — 各数据源的记录数、新鲜度、采集器状态
+你的核心职责：
+
+1. **主动分析** — 不等用户问，你看到数据后自己判断：
+   - 金价剧烈波动但评分未更新 → 主动指出时间差和可能的影响
+   - 多空因子严重矛盾 → 指出核心分歧和潜在方向
+   - 数据源断流 → 立即报告哪些数据过期
+   - 模型准确率下降 → 建议切换或重新训练
+
+2. **决策支持** — 基于数据给出可执行的建议：
+   - "当前评分已是25分钟前，金价已涨2.5%，建议重新评分"
+   - "CFTC 投机净多占比52%，处于极端拥挤水平，注意回调风险"
+   - "预测模型准确率仅47%，候选模型准确率60%，建议切换"
+
+3. **自主操作** — 当用户同意时，可触发系统操作。
+   如果你的建议后跟 [可执行]，表示可以立即操作：
+   - [重新评分] [切换预测模型] [检查采集器] [刷新数据]
 
 工作方式：
-- 用户问任何问题，先对照系统数据给出基于事实的回答
-- 市场分析：结合实时金价和因子评分，指出核心驱动和矛盾信号
-- 预测解读：解释当前预测的逻辑和置信度
-- 系统诊断：检查数据新鲜度和采集器状态，定位问题
+- 先给出分析 → 再给出建议 → 最后提供可执行的操作
 - 始终用中文回复，简洁专业，客观中立
+- 只做分析参考，不给出投资建议
 
 重要规则：
-- 只做分析参考，不给出投资建议
 - 回答应基于提供的系统数据，不编造信息
-- 不清楚的地方明确指出
-- 预测和评分调整建议用"可能"、"预计"等措辞"""
+- 评分调整建议用"可能"、"预计"等措辞
+- 数据异常时优先报告，而不是等用户发现"""
 
 
-# ==================== 全系统上下文构建 ====================
+# ==================== 智能系统上下文 ====================
 
 def _build_system_context(db: Session) -> str:
-    """构建完整的系统数据上下文，供 AI 分析使用。缓存 30 秒。"""
+    """构建完整的系统数据上下文 + 预计算智能洞察。缓存 30 秒。"""
     import time as _time
     global _context_cache, _context_cache_time
     now = _time.time()
@@ -77,24 +83,28 @@ def _build_system_context(db: Session) -> str:
         return _context_cache.get("text", "")
 
     parts: list[str] = []
+    insights: list[str] = []  # 预计算洞察
     now_utc = datetime.now(timezone.utc)
 
     # ── 1. 实时金价 ──
+    gold_price = None
+    gold_change_pct = None
+    gold_ts = None
     try:
         from app.data.gold_price_collector import fetch_gold_price
         gold = fetch_gold_price(use_cache=False)
         if gold.get("ok"):
+            gold_price = gold.get("price")
+            gold_change_pct = gold.get("change_pct")
+            gold_ts = gold.get("timestamp")
             parts.append(
                 "## 实时金价\n\n"
-                f"- COMEX 黄金：${gold['price']:,.2f}（昨收 ${gold.get('previous_close', 0):,.0f}）\n"
+                f"- COMEX：${gold['price']:,.2f}（昨收 ${gold.get('previous_close', 0):,.0f}）\n"
                 f"- 涨跌：{gold.get('change', 0):+.2f}（{gold.get('change_pct', 0):+.2f}%）\n"
-                f"- 日内高/低：${gold.get('day_high', 0):,.0f} / ${gold.get('day_low', 0):,.0f}\n"
-                f"- 数据源：{gold.get('source', 'N/A')}（延迟 {gold.get('delay', 'N/A')}）\n"
-                f"- 更新时间：{gold.get('timestamp', 'N/A')}"
+                f"- 日内：高 ${gold.get('day_high', 0):,.0f} / 低 ${gold.get('day_low', 0):,.0f}\n"
+                f"- 更新：{gold.get('timestamp', 'N/A')}"
             )
-
         # 沪金
-        from app.data.gold_price_collector import _fetch_from_sina
         try:
             import requests as _req
             url = "https://hq.sinajs.cn/list=nf_AU0"
@@ -106,13 +116,15 @@ def _build_system_context(db: Session) -> str:
             if sh_price and sh_price > 0:
                 sh_high = float(fields[3]) if len(fields) > 3 else None
                 sh_low = float(fields[4]) if len(fields) > 4 else None
-                parts.append(f"## 沪金连续\n\n- 最新价：¥{sh_price:,.2f}/g\n- 日内高/低：{sh_high:,.0f}/{sh_low:,.0f}")
+                parts.append(f"## 沪金连续\n\n- 最新：¥{sh_price:,.2f}/g\n- 日内：高{sh_high:,.0f} / 低{sh_low:,.0f}")
         except Exception:
             pass
     except Exception:
-        parts.append("## 实时金价\n\n暂无法获取实时金价。")
+        parts.append("## 实时金价\n\n暂无法获取。")
 
-    # ── 2. 评分快照 ──
+    # ── 2. 评分快照 + 与金价交叉验证 ──
+    score_total = None
+    score_ts = None
     try:
         snapshot = db.scalar(select(GoldScoreSnapshot).order_by(GoldScoreSnapshot.timestamp.desc()))
         if snapshot:
@@ -130,136 +142,219 @@ def _build_system_context(db: Session) -> str:
             except json.JSONDecodeError:
                 pass
 
+            score_total = snapshot.total_score
+            score_ts = snapshot.timestamp
             top_5 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
             bottom_5 = sorted(scores.items(), key=lambda x: x[1])[:5]
 
             parts.append(
                 "## 25 因子评分\n\n"
-                f"- 总分：{snapshot.total_score:+.1f}（范围 -100 ~ +100）\n"
-                f"- 方向：{snapshot.direction}\n"
-                f"- 评分时间：{snapshot.timestamp}\n"
-                f"- 短线动量贡献：{horizon.get('短线动量_贡献分', 'N/A')}\n"
-                f"- 中期宏观贡献：{horizon.get('中期宏观_贡献分', 'N/A')}\n"
-                f"- 长期结构贡献：{horizon.get('长期结构_贡献分', 'N/A')}\n\n"
+                f"- 总分：{snapshot.total_score:+.1f} / 方向：{snapshot.direction}\n"
+                f"- 时间：{snapshot.timestamp}\n"
+                f"- 短线：{horizon.get('短线动量_贡献分', 'N/A')} | "
+                f"中期：{horizon.get('中期宏观_贡献分', 'N/A')} | "
+                f"长期：{horizon.get('长期结构_贡献分', 'N/A')}\n\n"
                 f"利多 Top 5：{json.dumps(dict(top_5), ensure_ascii=False)}\n"
                 f"利空 Top 5：{json.dumps(dict(bottom_5), ensure_ascii=False)}\n"
                 f"风险标志：{json.dumps(risk_flags, ensure_ascii=False)}\n"
-                f"完整因子分：{json.dumps(scores, ensure_ascii=False)}"
+                f"完整因子：{json.dumps(scores, ensure_ascii=False)}"
             )
+
+            # 智能洞察：评分与金价的时间差
+            if gold_ts and score_ts and gold_change_pct is not None:
+                try:
+                    gold_dt = datetime.fromisoformat(gold_ts.replace("Z", "+00:00"))
+                    age_min = (gold_dt.replace(tzinfo=None) - score_ts.replace(tzinfo=None)).total_seconds() / 60
+                    if abs(gold_change_pct or 0) > 1.5 and age_min > 5:
+                        insights.append(
+                            f"⚠️ 金价已波动 {gold_change_pct:+.1f}%，但评分是 {age_min:.0f} 分钟前的，"
+                            f"建议重新评分以反映最新行情。"
+                        )
+                except Exception:
+                    pass
+
+            # 智能洞察：多空矛盾
+            if top_5 and bottom_5:
+                max_long = top_5[0][1]
+                max_short = bottom_5[0][1]
+                if max_long > 5 and max_short < -3:
+                    insights.append(
+                        f"⚠️ 因子矛盾：最强利多「{top_5[0][0]}」({max_long:+.1f}) vs "
+                        f"最强利空「{bottom_5[0][0]}」({max_short:+.1f})，市场存在分歧。"
+                    )
         else:
             parts.append("## 评分\n\n暂无评分数据。")
     except Exception:
         parts.append("## 评分\n\n评分数据读取失败。")
 
-    # ── 3. 预测数据 ──
+    # ── 3. 预测数据 + 模型告警 ──
     try:
         from app.models import GoldPredictionSnapshot, PredictionModelVersion
         pred = db.scalar(select(GoldPredictionSnapshot).order_by(GoldPredictionSnapshot.timestamp.desc()))
         active_model = db.scalar(select(PredictionModelVersion).where(PredictionModelVersion.is_active == True))
         if pred:
-            pred_data = {
-                "预测时间": str(pred.timestamp),
-                "当前价格": pred.current_price,
-                "模型版本": pred.model_version,
-            }
+            pred_data = {"当前价格": pred.current_price, "预测时间": str(pred.timestamp)}
             for h in [1, 7, 30, 90, 180, 360]:
                 key = f"horizon_{h}d_price"
                 val = getattr(pred, key, None)
                 if val is not None:
-                    pred_data[f"{h}天预测价"] = val
+                    pred_data[f"{h}天"] = val
             model_info = ""
             if active_model:
+                acc = (active_model.direction_accuracy or 0) * 100
                 model_info = (
-                    f"\n\n激活模型：{active_model.version}（{active_model.method}）\n"
-                    f"方向准确率：{(active_model.direction_accuracy or 0)*100:.0f}%（{active_model.evaluated_count or 0}条评估）\n"
-                    f"MAPE：{active_model.mape_price_pct or 0:.1f}%"
+                    f"\n\n模型：{active_model.version} | 方法：{active_model.method}\n"
+                    f"方向准确率：{acc:.0f}%（{active_model.evaluated_count or 0}条）| MAPE：{active_model.mape_price_pct or 0:.1f}%"
                 )
+                if acc < 30 and (active_model.evaluated_count or 0) > 10:
+                    insights.append(
+                        f"⚠️ 预测模型准确率仅 {acc:.0f}%，建议检查是否有更好的候选模型可切换。"
+                    )
             parts.append(f"## 价格预测\n\n{json.dumps(pred_data, ensure_ascii=False)}{model_info}")
-    except Exception:
-        parts.append("## 价格预测\n\n预测数据暂不可用。")
-
-    # ── 4. 宏观指标快照 ──
-    try:
-        from app.models import MacroObservation, MacroSeries
-        key_series = ["DFII10", "DGS10", "T10YIE", "DTWEXBGS", "VIXCLS", "FEDFUNDS"]
-        key_labels = {"DFII10": "实际利率", "DGS10": "10年美债", "T10YIE": "通胀预期",
-                       "DTWEXBGS": "美元指数", "VIXCLS": "VIX", "FEDFUNDS": "联邦基金利率"}
-        macro_lines = []
-        for sid in key_series:
-            row = db.scalar(select(MacroObservation).where(MacroObservation.series_id == sid).order_by(MacroObservation.timestamp.desc()))
-            if row and row.value is not None:
-                label = key_labels.get(sid, sid)
-                macro_lines.append(f"- {label}：{row.value:.4f}（{row.timestamp.strftime('%Y-%m-%d') if row.timestamp else '?'}）")
-        if macro_lines:
-            parts.append("## 宏观指标\n\n" + "\n".join(macro_lines))
     except Exception:
         pass
 
-    # ── 5. CFTC 持仓 ──
+    # ── 4. 宏观 + CFTC + 情绪 + 溢价 ──
+    try:
+        from app.models import MacroObservation
+        key_series = {"DFII10": "实际利率", "DGS10": "10年美债", "T10YIE": "通胀预期",
+                       "DTWEXBGS": "美元指数", "VIXCLS": "VIX", "FEDFUNDS": "联邦基金利率"}
+        lines = []
+        for sid, label in key_series.items():
+            row = db.scalar(select(MacroObservation).where(MacroObservation.series_id == sid).order_by(MacroObservation.timestamp.desc()))
+            if row and row.value is not None:
+                lines.append(f"- {label}：{row.value:.4f}（{row.timestamp.strftime('%Y-%m-%d') if row.timestamp else '?'}）")
+        if lines:
+            parts.append("## 宏观指标\n\n" + "\n".join(lines))
+    except Exception:
+        pass
+
     try:
         from app.models import CftcPosition
         cftc = db.scalar(select(CftcPosition).order_by(CftcPosition.timestamp.desc()))
         if cftc:
+            net_pct = (cftc.noncommercial_net / cftc.open_interest * 100) if cftc.open_interest else 0
             parts.append(
                 "## CFTC 持仓\n\n"
-                f"- 报告日期：{cftc.timestamp}\n"
-                f"- 投机净多仓：{cftc.noncommercial_net:,}\n"
-                f"- 投机多头：{cftc.noncommercial_long:,} / 空头：{cftc.noncommercial_short:,}\n"
-                f"- 商业净空仓：{cftc.commercial_short - cftc.commercial_long:,}\n"
+                f"- 日期：{cftc.timestamp}\n"
+                f"- 投机净多：{cftc.noncommercial_net:,}（占总持仓 {net_pct:.1f}%）\n"
+                f"- 多头 {cftc.noncommercial_long:,} / 空头 {cftc.noncommercial_short:,}\n"
+                f"- 商业净空：{cftc.commercial_short - cftc.commercial_long:,}\n"
                 f"- 总持仓：{cftc.open_interest:,}"
             )
+            if net_pct > 40:
+                insights.append(f"⚠️ CFTC 投机净多占比 {net_pct:.1f}%，处于拥挤水平，警惕多头踩踏。")
     except Exception:
         pass
 
-    # ── 6. 新闻情绪 ──
     try:
         from app.models import NewsSentiment
         ns = db.scalar(select(NewsSentiment).order_by(NewsSentiment.timestamp.desc()))
         if ns:
+            age_d = (now_utc - ns.timestamp.replace(tzinfo=None)).total_seconds() / 86400 if ns.timestamp else 0
             parts.append(
                 "## 新闻情绪\n\n"
-                f"- 最新情绪分：{ns.sentiment_score:.2f}（范围 -1 ~ +1）\n"
-                f"- 标题：{ns.title or '(无)'}\n"
-                f"- 时间：{ns.timestamp}\n"
-                f"- 来源：{ns.source}"
+                f"- 情绪分：{ns.sentiment_score:.2f}（-1~+1）\n"
+                f"- 标题：{ns.title or '(无)'}\n- 时间：{ns.timestamp}"
             )
+            if age_d > 2:
+                insights.append(f"⚠️ 新闻情绪数据已 {age_d:.0f} 天未更新。")
     except Exception:
         pass
 
-    # ── 7. 中国溢价 ──
     try:
         from app.models import ChinaGoldPremium
         prem = db.scalar(select(ChinaGoldPremium).order_by(ChinaGoldPremium.timestamp.desc()))
         if prem:
-            parts.append(
-                "## 中国溢价\n\n"
-                f"- 溢价率：{prem.premium_pct:+.2f}%\n"
-                f"- 时间：{prem.timestamp}\n"
-                f"- 来源：{prem.source}"
-            )
+            parts.append(f"## 中国溢价\n\n- 溢价率：{prem.premium_pct:+.2f}%\n- 时间：{prem.timestamp}")
     except Exception:
         pass
 
-    # ── 8. 数据新鲜度 ──
+    # ── 5. 采集器健康 ──
     try:
-        from app.models import GoldPrice, CentralBankGold
-        gp = db.scalar(select(GoldPrice).order_by(GoldPrice.date.desc()))
-        cbg = db.scalar(select(CentralBankGold).order_by(CentralBankGold.timestamp.desc()))
-        lines = []
-        if gp:
-            age_h = (now_utc - gp.updated_at.replace(tzinfo=None)).total_seconds() / 3600 if gp.updated_at and gp.updated_at.tzinfo is None else None
-            lines.append(f"- 金价日线：{gp.date}，{age_h:.1f}h前" if age_h else f"- 金价日线：{gp.date}")
-        if cbg:
-            lines.append(f"- 央行购金：{cbg.timestamp}")
-        if lines:
-            parts.append("## 数据新鲜度\n\n" + "\n".join(lines))
+        from app.monitoring.collector_health import get_health_summary
+        health = get_health_summary()
+        critical = health.get("summary", {}).get("critical_issues", [])
+        stale = [c["name"] for c in health.get("collectors", []) if c["status"] == "stale"]
+        all_issues = critical + stale
+        if all_issues:
+            insights.append(f"⚠️ 采集器异常：{', '.join(all_issues)}")
+            parts.append(f"## 采集器状态\n\n整体：{health.get('overall')} | "
+                         f"异常采集器：{', '.join(all_issues) if all_issues else '无'}")
     except Exception:
         pass
+
+    # ── 智能洞察前置 ──
+    if insights:
+        parts.insert(0, "## ⚠️ 系统主动告警\n\n" + "\n".join(f"- {i}" for i in insights))
 
     text = "\n\n".join(parts)
     _context_cache = {"text": text}
     _context_cache_time = _time.time()
     return text
+
+
+# ==================== 自主操作 ====================
+
+AVAILABLE_ACTIONS = {
+    "重新评分": "重新计算一次评分快照（基于最新数据）",
+    "切换预测模型": "列出可用预测模型并切换到最佳候选",
+    "检查采集器": "检查所有数据采集器的健康状态",
+    "刷新数据": "立即触发一次完整的数据采集",
+}
+
+def execute_action(db: Session, action: str) -> dict[str, Any]:
+    """执行 AI 建议的系统操作。"""
+    if action == "重新评分":
+        try:
+            from app.scoring.score_optimizer import get_active_params
+            from app.scoring.gold_score import compute_and_store_gold_score, compute_and_store_gold_score_with_params
+            active_params = get_active_params(db)
+            if active_params is not None:
+                snap = compute_and_store_gold_score_with_params(db, active_params, source="ai_triggered")
+            else:
+                snap = compute_and_store_gold_score(db)
+            return {"ok": True, "action": action,
+                    "result": f"评分完成：总分 {snap.total_score:+.1f}，方向 {snap.direction}"}
+        except Exception as e:
+            return {"ok": False, "action": action, "error": str(e)}
+
+    if action == "切换预测模型":
+        try:
+            from app.models import PredictionModelVersion
+            from app.scoring.gold_predictor import _active_prediction_model, activate_prediction_model_version
+            active = _active_prediction_model(db)
+            candidates = db.scalars(
+                select(PredictionModelVersion)
+                .where(PredictionModelVersion.is_active == False)
+                .order_by(PredictionModelVersion.direction_accuracy.desc())
+            ).all()
+            if not candidates:
+                return {"ok": False, "action": action, "error": "没有可用的候选模型"}
+            best = candidates[0]
+            activate_prediction_model_version(db, best.version)
+            return {"ok": True, "action": action,
+                    "result": f"已从 {active.version if active else '?'} 切换到 {best.version}（准确率 {(best.direction_accuracy or 0)*100:.0f}%）"}
+        except Exception as e:
+            return {"ok": False, "action": action, "error": str(e)}
+
+    if action == "检查采集器":
+        try:
+            from app.monitoring.collector_health import get_health_summary
+            health = get_health_summary()
+            return {"ok": True, "action": action, "result": health}
+        except Exception as e:
+            return {"ok": False, "action": action, "error": str(e)}
+
+    if action == "刷新数据":
+        try:
+            from app.scheduler import collect_and_score_job
+            collect_and_score_job()
+            return {"ok": True, "action": action, "result": "数据采集和评分已完成"}
+        except Exception as e:
+            return {"ok": False, "action": action, "error": str(e)}
+
+    return {"ok": False, "action": action, "error": f"未知操作：{action}"}
 
 
 # ==================== DeepSeek 调用 ====================
@@ -289,7 +384,6 @@ def _call_deepseek(messages: list[dict]) -> str | None:
             resp = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT, verify=False)
             if resp.status_code in (429, 503):
                 wait = min(2 ** attempt, 8)
-                logger.warning("DeepSeek rate-limited (HTTP %d), retry %d/3 after %ds", resp.status_code, attempt + 1, wait)
                 _time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -307,7 +401,7 @@ def _call_deepseek(messages: list[dict]) -> str | None:
 
     logger.error("DeepSeek chat failed after retries: %s", last_error)
     if last_error and ("SSL" in str(last_error) or "SSLEOF" in str(last_error) or "timeout" in str(last_error).lower()):
-        return "AI 服务暂时不可用，请稍后重试。如持续失败，请检查网络连接。"
+        return "AI 服务暂时不可用，请稍后重试。"
     return f"AI 服务暂时不可用（{type(last_error).__name__ if last_error else 'unknown'}），请稍后重试。"
 
 
@@ -348,16 +442,43 @@ def _load_history(db: Session, session_id: str, limit: int = 0) -> list[dict]:
 # ==================== 公开接口 ====================
 
 def chat(db: Session, message: str, session_id: str = "default") -> dict[str, Any]:
-    """发送消息，获取 AI 回复。每次注入全系统上下文，对话自动持久化。"""
+    """发送消息，获取 AI 回复。每次注入完整系统上下文+智能洞察。"""
     _ensure_session(db, session_id)
     history = _load_history(db, session_id)
 
-    # 构建完整系统上下文
     system_ctx = _build_system_context(db)
 
-    # 组装消息：系统提示 → 全系统数据 → 历史 → 用户输入
+    # 操作指令识别
+    action_keywords = {
+        "重新评分": "重新评分", "重算评分": "重新评分", "刷新评分": "重新评分",
+        "切换模型": "切换预测模型", "换模型": "切换预测模型", "激活模型": "切换预测模型",
+        "检查采集器": "检查采集器", "采集器状态": "检查采集器",
+        "刷新数据": "刷新数据", "重新采集": "刷新数据",
+    }
+    matched_action = None
+    for kw, action in action_keywords.items():
+        if kw in message:
+            matched_action = action
+            break
+
+    if matched_action and len(message) < 20:
+        # 直接执行操作
+        result = execute_action(db, matched_action)
+        return {
+            "session_id": session_id,
+            "reply": json.dumps(result, ensure_ascii=False, indent=2),
+            "score_total": _latest_score(db),
+            "score_direction": _latest_direction(db),
+            "messages_count": len(history) // 2,
+            "action": matched_action,
+        }
+
     messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-    messages.append({"role": "system", "content": "## 当前系统数据\n\n" + system_ctx})
+    messages.append({"role": "system", "content": "## 当前系统数据与洞察\n\n" + system_ctx})
+
+    # 可用操作列表
+    actions_hint = "\n\n可执行的系统操作：" + ", ".join(f"[{a}]" for a in AVAILABLE_ACTIONS)
+    messages.append({"role": "system", "content": actions_hint})
 
     for entry in history[-MAX_HISTORY_TURNS * 2:]:
         messages.append(entry)
@@ -382,8 +503,32 @@ def chat(db: Session, message: str, session_id: str = "default") -> dict[str, An
     }
 
 
+def generate_insight(db: Session) -> dict[str, Any]:
+    """生成主动智能洞察（供仪表盘定时拉取）。"""
+    ctx = _build_system_context(db)
+
+    messages = [
+        {"role": "system", "content": """你是系统智能监控助手。基于当前数据，生成一条简短的主动洞察报告。
+
+要求：
+- 1-2 句话，不超过 100 字
+- 如果一切正常，报告系统状态
+- 如果有异常（数据过期、模型退化、金价异动），优先报告异常
+- 用中文，简洁专业
+- 格式：只返回文本，不要 JSON 或标记"""},
+        {"role": "user", "content": f"当前系统数据：\n\n{ctx}\n\n请生成主动洞察。"},
+    ]
+
+    try:
+        reply = _call_deepseek(messages)
+        return {"ok": True, "insight": reply or "系统运行正常。",
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+    except Exception:
+        return {"ok": False, "insight": "洞察生成失败。",
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
 def reset_session(db: Session, session_id: str) -> None:
-    """清空会话消息。"""
     msgs = db.scalars(select(ChatMessage).where(ChatMessage.session_id == session_id)).all()
     for m in msgs:
         db.delete(m)
@@ -399,35 +544,18 @@ def get_history(db: Session, session_id: str) -> list[dict]:
 
 
 def list_sessions(db: Session, limit: int = 50) -> list[dict]:
-    """列出所有对话会话。"""
-    rows = db.scalars(
-        select(ChatSession).order_by(ChatSession.updated_at.desc()).limit(limit)
-    ).all()
-    return [{
-        "session_id": r.session_id,
-        "title": r.title,
-        "message_count": r.message_count,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
-        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
-    } for r in rows]
+    rows = db.scalars(select(ChatSession).order_by(ChatSession.updated_at.desc()).limit(limit)).all()
+    return [{"session_id": r.session_id, "title": r.title, "message_count": r.message_count,
+             "created_at": r.created_at.isoformat() if r.created_at else None,
+             "updated_at": r.updated_at.isoformat() if r.updated_at else None} for r in rows]
 
 
 def get_session_messages(db: Session, session_id: str) -> list[dict]:
-    """获取指定会话的完整消息列表。"""
-    rows = db.scalars(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc())
-    ).all()
-    return [{
-        "role": r.role,
-        "content": r.content,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
-    } for r in rows]
+    rows = db.scalars(select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.asc())).all()
+    return [{"role": r.role, "content": r.content, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
 
 def delete_session(db: Session, session_id: str) -> bool:
-    """删除指定会话及其所有消息。"""
     msgs = db.scalars(select(ChatMessage).where(ChatMessage.session_id == session_id)).all()
     for m in msgs:
         db.delete(m)

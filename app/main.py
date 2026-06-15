@@ -82,6 +82,8 @@ from app.ai.chat import (
     list_sessions as ai_list_sessions,
     get_session_messages as ai_get_session_messages,
     delete_session as ai_delete_session,
+    execute_action as ai_execute_action,
+    generate_insight as ai_generate_insight,
 )
 
 
@@ -1362,6 +1364,19 @@ def ai_chat_archive_delete(session_id: str, db: Session = Depends(get_db)) -> di
     """删除指定归档会话。"""
     ai_delete_session(db, session_id)
     return {"ok": True, "session_id": session_id, "message": "会话已删除"}
+
+
+@app.post("/ai/action")
+def ai_action(action: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    """AI 自主操作：执行系统操作（重新评分、切换模型、检查采集器等）。"""
+    result = ai_execute_action(db, action)
+    return {"ok": result.get("ok", False), **result}
+
+
+@app.get("/ai/insight")
+def ai_insight(db: Session = Depends(get_db)) -> dict[str, object]:
+    """AI 主动智能洞察：分析系统状态，生成简短洞察报告。"""
+    return ai_generate_insight(db)
 
 
 @app.get("/ai/ui", response_class=HTMLResponse)
