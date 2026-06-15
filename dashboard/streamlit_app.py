@@ -336,7 +336,7 @@ def _safe_float(val: str) -> float | None:
 
 
 def _ago(ts_str: str) -> str:
-    """返回相对时间 + 双重时间戳。"""
+    """返回相对时长：10min / 2H / 3D"""
     if not ts_str:
         return "—"
     try:
@@ -344,13 +344,10 @@ def _ago(ts_str: str) -> str:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC_TZ)
         secs = (dt.datetime.now(UTC_TZ) - ts.astimezone(UTC_TZ)).total_seconds()
-        utc_str = ts.astimezone(UTC_TZ).strftime("%H:%M")
-        bj_str = ts.astimezone(BEIJING_TZ).strftime("%H:%M")
-        tz_label = f"UTC {utc_str} / 北京 {bj_str}"
-        if secs < 60: return f"刚刚 ({tz_label})"
-        if secs < 3600: return f"{int(secs/60)}分钟前 ({tz_label})"
-        if secs < 86400: return f"{int(secs/3600)}小时前 ({tz_label})"
-        return f"{int(secs/86400)}天前 ({tz_label})"
+        if secs < 60: return "刚刚"
+        if secs < 3600: return f"{int(secs/60)}min"
+        if secs < 86400: return f"{int(secs/3600)}H"
+        return f"{int(secs/86400)}D"
     except Exception:
         return ts_str[:16]
 
