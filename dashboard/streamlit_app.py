@@ -336,7 +336,7 @@ def _safe_float(val: str) -> float | None:
 
 
 def _ago(ts_str: str) -> str:
-    """返回相对时间：刚刚 / 3分钟前 / 1小时前"""
+    """返回相对时间 + 双重时间戳。"""
     if not ts_str:
         return "—"
     try:
@@ -344,10 +344,13 @@ def _ago(ts_str: str) -> str:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC_TZ)
         secs = (dt.datetime.now(UTC_TZ) - ts.astimezone(UTC_TZ)).total_seconds()
-        if secs < 60: return ts.astimezone(BEIJING_TZ).strftime("%H:%M:%S")
-        if secs < 3600: return f"{int(secs/60)}分钟前"
-        if secs < 86400: return f"{int(secs/3600)}小时前"
-        return f"{int(secs/86400)}天前"
+        utc_str = ts.astimezone(UTC_TZ).strftime("%H:%M")
+        bj_str = ts.astimezone(BEIJING_TZ).strftime("%H:%M")
+        tz_label = f"UTC {utc_str} / 北京 {bj_str}"
+        if secs < 60: return f"刚刚 ({tz_label})"
+        if secs < 3600: return f"{int(secs/60)}分钟前 ({tz_label})"
+        if secs < 86400: return f"{int(secs/3600)}小时前 ({tz_label})"
+        return f"{int(secs/86400)}天前 ({tz_label})"
     except Exception:
         return ts_str[:16]
 
@@ -1034,7 +1037,7 @@ if gold.get("ok") and gold.get("price"):
                 hovermode="x unified", showlegend=False
             )
             st.plotly_chart(fig, use_container_width=True)
-            latest_daily = pd.to_datetime(df["日期"].iloc[-1]).strftime("%Y-%m-%d %H:%M:%S")
+            latest_daily = pd.to_datetime(df["日期"].iloc[-1]).strftime("%Y-%m-%d %H:%M UTC")
             st.caption(f"金价日线：COMEX（黄） + 沪金连续（红，¥/g）。最新日线：{latest_daily}。COMEX 实时报价见上方卡片。")
     finally:
         db.close()
@@ -1291,7 +1294,7 @@ else:
         "displaylogo": False,
         "scrollZoom": True,
     })
-    st.caption(f"最新评分时间：{pd.to_datetime(latest['时间']).strftime('%Y-%m-%d %H:%M:%S')}。评分曲线为日频/快照数据，不代表逐秒行情。")
+    st.caption(f"最新评分时间：{pd.to_datetime(latest['时间']).strftime('%Y-%m-%d %H:%M UTC')}。评分曲线为日频/快照数据，不代表逐秒行情。")
 
     # 风险提示 — 可折叠
     with st.expander(f"💡 风险提示（{len(risks)} 条）", expanded=len(risks) <= 3):
@@ -1338,7 +1341,9 @@ else:
                     st.markdown("**数据质量备注**")
                     for q in quality:
                         st.markdown(f"- {q}")
-                st.caption(f"模型：{analysis.get('model', 'DeepSeek')} · 时间：{analysis.get('timestamp', '')}")
+                ts_str = analysis.get('timestamp', '')
+                ts_display = ts_str[:16].replace('T', ' ') if ts_str else '—'
+                st.caption(f"模型：{analysis.get('model', 'DeepSeek')} · UTC {ts_display}")
             else:
                 st.caption(f"AI 分析暂不可用：{ai.get('error', '未知')}（需在 .env 中配置 DEEPSEEK_API_KEY）")
         except Exception as e:
@@ -2116,5 +2121,5 @@ st.divider()
 st.caption(
     "本系统仅提供数据分析和风险提示，不构成任何投资建议。"
     f" 数据刷新间隔 {st.session_state['_rf_interval']}s · "
-    f"北京时间 {_now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
+    f"UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
 )
