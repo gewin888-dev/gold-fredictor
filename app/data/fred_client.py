@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -9,8 +10,6 @@ import requests
 import urllib3
 
 from app.config import get_settings
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
@@ -46,21 +45,31 @@ FRED_SERIES: list[FredSeriesConfig] = [
 
 
 class FredClient:
-    def __init__(self, api_key: str | None = None, timeout: int = 30) -> None:
+    def __init__(self, api_key: str | None = None, timeout: int = 10) -> None:
         settings = get_settings()
         self.api_key = api_key if api_key is not None else settings.fred_api_key
         self.timeout = timeout
+        self.verify_ssl = bool(settings.fred_verify_ssl)
+        # Python 3.9 + LibreSSL 兼容性
+        urllib3.disable_warnings()
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.api_key:
             raise ValueError("FRED_API_KEY is not configured. Add it to .env first.")
+        if len(self.api_key) < 32:
+            raise ValueError(f"FRED_API_KEY looks truncated (len={len(self.api_key)}, expected 32). Check .env.")
 
-        response = requests.get(
-            f"{FRED_BASE_URL}/{path}",
-            params={**params, "api_key": self.api_key, "file_type": "json"},
-            timeout=self.timeout,
-            verify=False,
-        )
+        request_kwargs = {
+            "params": {**params, "api_key": self.api_key, "file_type": "json"},
+            "timeout": self.timeout,
+            "verify": self.verify_ssl,
+        }
+        if self.verify_ssl:
+            response = requests.get(f"{FRED_BASE_URL}/{path}", **request_kwargs)
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                response = requests.get(f"{FRED_BASE_URL}/{path}", **request_kwargs)
         response.raise_for_status()
         payload = response.json()
         if "error_message" in payload:

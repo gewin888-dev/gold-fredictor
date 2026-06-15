@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -9,6 +10,8 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.data.fred_client import FRED_SERIES, FredClient, FredSeriesConfig
 from app.models import MacroObservation, MacroSeries
+
+logger = logging.getLogger(__name__)
 
 
 def upsert_series(db: Session, series: FredSeriesConfig) -> MacroSeries:
@@ -53,17 +56,29 @@ def upsert_observation(db: Session, series_id: str, timestamp, value: float) -> 
 
 
 def collect_fred_data(db: Session, observation_start: str | None = None) -> dict[str, int]:
+    """采集 FRED 数据。每个系列独立重试，单点失败不阻塞其他系列。"""
     settings = get_settings()
-    client = FredClient()
     start = observation_start or settings.fred_observation_start
     counts: dict[str, int] = {}
+    failed = 0
+    total = len(FRED_SERIES)
 
     for series in FRED_SERIES:
-        upsert_series(db, series)
-        df = client.get_observations(series.series_id, observation_start=start)
-        for row in df.itertuples(index=False):
-            upsert_observation(db, series.series_id, row.timestamp, row.value)
-        counts[series.series_id] = len(df)
+        try:
+            client = FredClient(timeout=8)
+            upsert_series(db, series)
+            df = client.get_observations(series.series_id, observation_start=start)
+            for row in df.itertuples(index=False):
+                upsert_observation(db, series.series_id, row.timestamp, row.value)
+            counts[series.series_id] = len(df)
+        except Exception as e:
+            failed += 1
+            logger.warning("FRED series %s failed: %s", series.series_id, str(e)[:100])
 
-    db.commit()
+    if failed > 0:
+        raise RuntimeError(
+            f"FRED collection: {total - failed}/{total} succeeded, {failed} failed "
+            f"(first error likely Python 3.9 + LibreSSL SSLEOFError)"
+        )
+
     return counts
