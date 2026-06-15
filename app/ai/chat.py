@@ -30,6 +30,10 @@ API_TIMEOUT = 45
 API_MAX_TOKENS = 2048
 API_TEMP = 0.5
 MAX_HISTORY_TURNS = 30
+HEALTH_CACHE_TTL = 30  # 系统健康状态缓存秒数
+
+_health_cache: dict = {}
+_health_cache_time: float = 0.0
 
 
 # ==================== DeepSeek 调用 ====================
@@ -89,7 +93,13 @@ def _score_context(db: Session) -> str:
 
 
 def _system_health_context(db: Session) -> str:
-    """收集系统健康状态信息。"""
+    """收集系统健康状态信息（缓存 30 秒避免重复查询）。"""
+    import time as _time
+    global _health_cache, _health_cache_time
+    now = _time.time()
+    if _health_cache and now - _health_cache_time < HEALTH_CACHE_TTL:
+        return _health_cache.get("text", "")
+
     from app.models import (
         CentralBankGold, CftcPosition, ChinaGoldPremium,
         GoldPrice, MacroObservation, NewsSentiment,
@@ -135,11 +145,14 @@ def _system_health_context(db: Session) -> str:
     except Exception:
         pass
 
-    return (
+    text = (
         "## 系统健康状态\n\n"
         f"数据表行数：{json.dumps(rows, ensure_ascii=False, indent=2)}\n\n"
         f"评分方向分布：{json.dumps(direction_counts, ensure_ascii=False)}"
     )
+    _health_cache = {"text": text}
+    _health_cache_time = _time.time()
+    return text
 
 
 def _call_deepseek(messages: list[dict]) -> str | None:
@@ -160,15 +173,33 @@ def _call_deepseek(messages: list[dict]) -> str | None:
         "max_tokens": API_MAX_TOKENS,
     }
 
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT, verify=False)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error("DeepSeek chat failed: %s", e)
-        if "SSL" in str(e) or "SSLEOF" in str(e) or "timeout" in str(e).lower():
-            return "AI 服务暂时不可用，请稍后重试。如持续失败，请检查网络连接。"
-        return f"AI 服务暂时不可用（{type(e).__name__}），请稍后重试。"
+    import time as _time
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT, verify=False)
+            if resp.status_code in (429, 503):
+                wait = min(2 ** attempt, 8)
+                logger.warning("DeepSeek rate-limited (HTTP %d), retry %d/3 after %ds", resp.status_code, attempt + 1, wait)
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (429, 503):
+                wait = min(2 ** attempt, 8)
+                _time.sleep(wait)
+                continue
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            break
+
+    logger.error("DeepSeek chat failed after retries: %s", last_error)
+    if last_error and ("SSL" in str(last_error) or "SSLEOF" in str(last_error) or "timeout" in str(last_error).lower()):
+        return "AI 服务暂时不可用，请稍后重试。如持续失败，请检查网络连接。"
+    return f"AI 服务暂时不可用（{type(last_error).__name__ if last_error else 'unknown'}），请稍后重试。"
 
 
 # ==================== DB 持久化 ====================

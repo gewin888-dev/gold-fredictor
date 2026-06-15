@@ -201,25 +201,44 @@ def _call_deepseek(prompt: str) -> dict[str, Any] | None:
     }
 
     resp = None
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT_SECONDS, verify=False)
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except json.JSONDecodeError:
-        raw_text = resp.text if resp else ""
-        match = re.search(r'\{[\s\S]*\}', raw_text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-        logger.warning("DeepSeek returned non-JSON response")
-        return None
-    except (requests.RequestException, KeyError, IndexError) as e:
-        logger.warning("DeepSeek API call failed: %s", e)
-        return None
+    import time as _time
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT_SECONDS, verify=False)
+            if resp.status_code in (429, 503):
+                wait = min(2 ** attempt, 8)
+                logger.warning("DeepSeek rate-limited (HTTP %d), retry %d/3", resp.status_code, attempt + 1)
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return json.loads(content)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (429, 503):
+                wait = min(2 ** attempt, 8)
+                _time.sleep(wait)
+                continue
+            break
+        except json.JSONDecodeError:
+            raw_text = resp.text if resp else ""
+            match = re.search(r'\{[\s\S]*\}', raw_text)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+            break
+        except (requests.RequestException, KeyError, IndexError) as e:
+            last_err = e
+            break
+
+    if resp is not None and resp.status_code in (429, 503):
+        logger.warning("DeepSeek API call failed after retries (rate-limited)")
+    else:
+        logger.warning("DeepSeek API call failed: %s", last_err or (resp.status_code if resp is not None else 'unknown'))
+    return None
 
 
 # ── 公开接口 ──────────────────────────────────────────────────────
