@@ -851,6 +851,25 @@ with st.expander(health_label, expanded=False):
     for reason in health_payload.get("reasons", []):
         st.caption(f"• {reason}")
 
+# ── 采集器健康 + AI 洞察 ──
+try:
+    collector_health = api("/health/collectors")
+    if collector_health.get("ok"):
+        summary = collector_health.get("summary", {})
+        critical_issues = summary.get("critical_issues", [])
+        if critical_issues or summary.get("overall") != "healthy":
+            issues_text = "、".join(critical_issues) if critical_issues else "无严重问题"
+            st.warning(f"⚠️ 采集器异常：{issues_text}（健康 {summary.get('healthy',0)}/{summary.get('total',0)}）")
+except Exception:
+    pass
+
+try:
+    insight = api("/ai/insight")
+    if insight.get("ok") and insight.get("insight"):
+        st.info(f"🤖 {insight['insight']}")
+except Exception:
+    pass
+
 # ═══════════════════════════════════════════
 # 时间条 + 金价卡片
 # ═══════════════════════════════════════════

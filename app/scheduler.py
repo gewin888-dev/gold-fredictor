@@ -259,7 +259,19 @@ def collect_and_score_job() -> None:
                 }
                 for row in list_macro_events(db, days_ahead=30)
             ]
-            send_score_alert_with_health(snapshot, get_data_health(db), events)
+            # 采集器健康
+            collector_status = ""
+            try:
+                from app.monitoring.collector_health import get_health_summary
+                h = get_health_summary()
+                issues = h.get("summary", {}).get("critical_issues", [])
+                if issues:
+                    collector_status = f"⚠️ 异常采集器：{', '.join(issues)}"
+                else:
+                    collector_status = f"✅ 采集器正常（{h.get('summary',{}).get('healthy',0)}/{h.get('summary',{}).get('total',0)}）"
+            except Exception:
+                collector_status = "采集器状态：检查失败"
+            send_score_alert_with_health(snapshot, get_data_health(db), events, collector_status)
     finally:
         db.close()
 

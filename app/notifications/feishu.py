@@ -43,6 +43,7 @@ def build_score_alert_text(
     score_snapshot: GoldScoreSnapshot,
     data_health: dict[str, Any] | None = None,
     upcoming_events: list[dict[str, Any]] | None = None,
+    collector_status: str = "",
 ) -> str:
     from datetime import datetime, timedelta, timezone
 
@@ -75,6 +76,7 @@ def build_score_alert_text(
         f"评分: {score_snapshot.total_score}\n"
         f"方向: {score_snapshot.direction}\n"
         f"数据健康: {health_status}\n"
+        f"采集器: {collector_status or '未检查'}\n"
         f"摘要: {score_snapshot.summary}\n\n"
         f"主要因子:\n"
         f"{factor_lines or '- 暂无因子'}\n\n"
@@ -90,11 +92,13 @@ def send_score_alert_with_health(
     score_snapshot: GoldScoreSnapshot,
     data_health: dict[str, Any] | None = None,
     upcoming_events: list[dict[str, Any]] | None = None,
+    collector_status: str = "",
 ) -> dict[str, Any]:
     return send_text_message(
         build_score_alert_text(
             score_snapshot,
             data_health=data_health,
             upcoming_events=upcoming_events,
+            collector_status=collector_status,
         )
     )

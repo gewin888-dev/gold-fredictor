@@ -135,6 +135,14 @@ async def lifespan(_: FastAPI):
     # 启动日内金价快照记录（用于 24 小时走势图）
     start_intraday_recorder()
 
+    # 启动自检：记录所有采集器初始状态
+    try:
+        from app.monitoring.collector_health import record_success
+        record_success("intraday_snapshot", "startup")
+        logger.info("启动自检完成，采集器监控已就绪")
+    except Exception:
+        pass
+
     try:
         yield
     finally:
