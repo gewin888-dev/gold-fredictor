@@ -446,7 +446,7 @@ def get_shanghai_daily() -> pd.DataFrame:
 
 @st.cache_data(ttl=120)
 def get_shanghai_intraday() -> pd.DataFrame:
-    """获取沪金连续日内5分钟K线（新浪财经，仅当日）。"""
+    """获取沪金连续日内5分钟K线（新浪财经，仅当日）。返回 UTC 时间戳，与 COMEX 对齐。"""
     import json
     import requests as req
     try:
@@ -460,10 +460,11 @@ def get_shanghai_intraday() -> pd.DataFrame:
             data = json.loads(text[start:end])
             df = pd.DataFrame(data)
             if not df.empty:
-                df["timestamp"] = pd.to_datetime(df["d"])
-                cutoff = pd.Timestamp.now() - pd.Timedelta(hours=36)
+                # 新浪返回北京时间，转为 UTC 与 COMEX 对齐
+                df["timestamp"] = pd.to_datetime(df["d"]).dt.tz_localize('Asia/Shanghai').dt.tz_convert('UTC').dt.tz_localize(None)
+                cutoff = pd.Timestamp.now(tz='UTC').tz_localize(None) - pd.Timedelta(hours=36)
                 df = df[df["timestamp"] >= cutoff]
-                df = df[df["timestamp"] <= pd.Timestamp.now()]
+                df = df[df["timestamp"] <= pd.Timestamp.now(tz='UTC').tz_localize(None)]
                 df["close"] = df["c"].astype(float)
                 return df.sort_values("timestamp")
         return pd.DataFrame()
@@ -746,6 +747,24 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
+    # 💬 AI 对话开关
+    st.markdown("### 💬 AI 助手")
+    if "show_ai_chat" not in st.session_state:
+        st.session_state.show_ai_chat = False
+    show_chat = st.toggle("打开 AI 对话窗口", value=st.session_state.show_ai_chat,
+                          help="点击后在主区域上方打开 AI 对话悬浮窗口，可输入地缘事件/系统维护问题")
+    if show_chat != st.session_state.show_ai_chat:
+        st.session_state.show_ai_chat = show_chat
+        st.rerun()
+    # 独立窗口快捷入口
+    st.markdown(
+        '<a href="http://127.0.0.1:8000/ai/ui" target="_blank" style="text-decoration:none">'
+        '<button style="width:100%;padding:8px;background:#334155;border:none;border-radius:6px;'
+        'color:#e2e8f0;font-size:13px;cursor:pointer;margin-top:4px">'
+        '🔗 打开独立窗口</button></a>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
     st.markdown("### ⚙️ 自动优化")
     auto_config = api("/settings/auto-optimize")
     auto_settings = auto_config.get("settings", {})
@@ -973,6 +992,17 @@ if gold.get("ok") and gold.get("price"):
             if not sh_daily.empty:
                 sh_daily["日期"] = pd.to_datetime(sh_daily["d"])
                 sh_daily["收盘_cny"] = sh_daily["c"].astype(float)
+                # 如果今天还没日线数据，用实时报价补一条
+                today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+                if today_str not in sh_daily["d"].values:
+                    sh_live = get_shanghai_gold()
+                    if sh_live.get("ok"):
+                        sh_daily = pd.concat([
+                            sh_daily,
+                            pd.DataFrame([{"d": today_str, "c": sh_live["price"],
+                                           "日期": pd.Timestamp(today_str),
+                                           "收盘_cny": float(sh_live["price"])}])
+                        ], ignore_index=True)
                 start_d = df["日期"].min()
                 sh_line = sh_daily[(sh_daily["日期"] >= start_d - pd.Timedelta(days=2)) & (sh_daily["日期"] <= df["日期"].max() + pd.Timedelta(days=2))]
             fig = go.Figure()
@@ -1098,6 +1128,174 @@ if gold.get("ok") and gold.get("price"):
         st.caption("日内金价快照不足，后台记录器启动并采集到数据后会显示走势。")
 else:
     st.warning("实时金价暂时无法获取。")
+
+# ═══════════════════════════════════════════
+# 💬 AI 对话悬浮窗口（侧边栏开关控制）
+# ═══════════════════════════════════════════
+
+if st.session_state.get("show_ai_chat"):
+    with st.container():
+        st.markdown("""
+        <style>
+        .ai-chat-panel {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 0;
+            margin: 8px 0 16px 0;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+        }
+        .ai-chat-header {
+            background: rgba(59,130,246,0.15);
+            padding: 10px 16px;
+            border-radius: 12px 12px 0 0;
+            border-bottom: 1px solid #1e3a5f;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .ai-chat-body {
+            padding: 12px 16px;
+            max-height: 480px;
+            overflow-y: auto;
+        }
+        .ai-chat-msg-user {
+            background: rgba(59,130,246,0.12);
+            border-left: 3px solid #3b82f6;
+            padding: 8px 12px;
+            border-radius: 0 6px 6px 0;
+            margin: 6px 0;
+            color: #e2e8f0;
+            font-size: 0.88rem;
+        }
+        .ai-chat-msg-assistant {
+            background: rgba(148,163,184,0.06);
+            border-left: 3px solid #64748b;
+            padding: 8px 12px;
+            border-radius: 0 6px 6px 0;
+            margin: 6px 0;
+            color: #cbd5e1;
+            font-size: 0.86rem;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        st.markdown('<div class="ai-chat-panel">', unsafe_allow_html=True)
+
+        # Header
+        ch1, ch2 = st.columns([10, 1])
+        with ch1:
+            st.markdown('### 💬 AI 助手（对话窗口）')
+        with ch2:
+            if st.button("✕", key="close_ai_chat", help="关闭对话窗口"):
+                st.session_state.show_ai_chat = False
+                st.rerun()
+
+        st.caption("输入地缘事件、宏观变化或系统维护问题，AI 结合当前数据给出分析。")
+
+        # Init messages
+        if "ai_chat_msgs" not in st.session_state:
+            st.session_state.ai_chat_msgs = []
+            try:
+                hist = api("/ai/chat/history", params={"session_id": "dashboard"})
+                if hist.get("ok") and hist.get("messages"):
+                    st.session_state.ai_chat_msgs = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in hist["messages"]
+                    ]
+            except Exception:
+                pass
+
+        # Messages display
+        chat_body = '<div class="ai-chat-body">'
+        for msg in st.session_state.ai_chat_msgs[-20:]:
+            cls = "ai-chat-msg-user" if msg["role"] == "user" else "ai-chat-msg-assistant"
+            label = "👤" if msg["role"] == "user" else "🤖"
+            safe_content = html.escape(msg["content"]).replace("\n", "<br>")
+            chat_body += f'<div class="{cls}"><strong>{label}</strong> {safe_content}</div>'
+        chat_body += '</div>'
+        st.markdown(chat_body, unsafe_allow_html=True)
+
+        # Input
+        prompt = st.chat_input("输入事件或问题…", key="ai_chat_panel_input")
+        if prompt:
+            st.session_state.ai_chat_msgs.append({"role": "user", "content": prompt})
+            with st.spinner("AI 分析中…"):
+                try:
+                    resp = api("/ai/chat", "post", json={"message": prompt, "session_id": "dashboard"})
+                    if resp.get("ok"):
+                        reply = resp.get("reply", "（无回复）")
+                        st.session_state.ai_chat_msgs.append({"role": "assistant", "content": reply})
+                    else:
+                        st.session_state.ai_chat_msgs.append(
+                            {"role": "assistant", "content": f"对话失败：{resp.get('reply', '未知错误')}"}
+                        )
+                except Exception as e:
+                    st.session_state.ai_chat_msgs.append({"role": "assistant", "content": f"连接失败：{e}"})
+            st.rerun()
+
+        # Controls
+        cc1, cc2, cc3 = st.columns([1, 1, 3])
+        with cc1:
+            if st.button("🗑️ 清空", key="ai_chat_clear", use_container_width=True):
+                try:
+                    api("/ai/chat/reset", "post", params={"session_id": "dashboard"})
+                except Exception:
+                    pass
+                st.session_state.ai_chat_msgs = []
+                st.rerun()
+        with cc2:
+            if st.button("📋 归档", key="ai_chat_archive_btn", use_container_width=True):
+                st.session_state.show_ai_archive = not st.session_state.get("show_ai_archive", False)
+                st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # 归档面板
+    if st.session_state.get("show_ai_archive"):
+        with st.container():
+            st.markdown("#### 📋 对话归档")
+            try:
+                archive = api("/ai/chat/archive")
+                if archive.get("ok"):
+                    sessions = archive.get("sessions", [])
+                    if sessions:
+                        for s in sessions[:20]:
+                            sid = s.get("session_id", "")
+                            title = s.get("title", "")[:40]
+                            count = s.get("message_count", 0)
+                            updated = s.get("updated_at", "")[:16]
+
+                            sc1, sc2, sc3 = st.columns([6, 2, 1])
+                            with sc1:
+                                st.caption(f"**{title}** · {count}条消息 · {updated}")
+                            with sc2:
+                                if st.button("查看", key=f"view_{sid}"):
+                                    st.session_state.view_session = sid
+                                    st.rerun()
+                            with sc3:
+                                if st.button("🗑", key=f"del_{sid}"):
+                                    api("delete", f"/ai/chat/archive/{sid}")
+                                    st.rerun()
+
+                        # 查看归档详情
+                        view_sid = st.session_state.get("view_session")
+                        if view_sid:
+                            detail = api(f"/ai/chat/archive/{view_sid}")
+                            if detail.get("ok"):
+                                with st.expander(f"📄 {view_sid} 详情", expanded=True):
+                                    for m in detail.get("messages", []):
+                                        role_label = "👤 用户" if m["role"] == "user" else "🤖 AI"
+                                        st.markdown(f"**{role_label}** ({m.get('created_at', '')[:16]})")
+                                        st.markdown(m["content"])
+                                        st.divider()
+                                    if st.button("关闭详情"):
+                                        st.session_state.view_session = None
+                                        st.rerun()
+                    else:
+                        st.caption("暂无归档对话")
+            except Exception as e:
+                st.caption(f"加载归档失败：{e}")
 
 st.divider()
 
@@ -1278,6 +1476,45 @@ else:
                 f'{icon} {r}</div>',
                 unsafe_allow_html=True,
             )
+
+    # AI 解读 — DeepSeek 分析
+    with st.expander("🤖 AI 解读", expanded=False):
+        try:
+            ai = api("/ai/analysis")
+            if ai.get("ok"):
+                analysis = ai.get("analysis", {})
+                # 概览
+                st.markdown(f"**市场概览**：{analysis.get('overview', '')}")
+                # 核心驱动因子
+                drivers = analysis.get("drivers", [])
+                if drivers:
+                    st.markdown("**核心驱动因子**")
+                    for d in drivers[:5]:
+                        ico = {"利多": "🟢", "利空": "🔴", "中性": "⚪"}.get(d.get("impact", ""), "⚪")
+                        st.markdown(f"- {ico} **{d.get('factor', '')}**（{d.get('impact', '')}）：{d.get('reason', '')}")
+                # 矛盾信号
+                contradictions = analysis.get("contradictions", [])
+                if contradictions:
+                    st.markdown("**⚠️ 矛盾信号**")
+                    for c in contradictions:
+                        st.markdown(f"- {c}")
+                # AI 风险提示
+                ai_risks = analysis.get("risks", [])
+                if ai_risks:
+                    st.markdown("**AI 风险提示**")
+                    for r in ai_risks:
+                        st.markdown(f"- {r}")
+                # 数据质量备注
+                quality = analysis.get("quality_notes", [])
+                if quality:
+                    st.markdown("**数据质量备注**")
+                    for q in quality:
+                        st.markdown(f"- {q}")
+                st.caption(f"模型：{analysis.get('model', 'DeepSeek')} · 时间：{analysis.get('timestamp', '')}")
+            else:
+                st.caption(f"AI 分析暂不可用：{ai.get('error', '未知')}（需在 .env 中配置 DEEPSEEK_API_KEY）")
+        except Exception as e:
+            st.caption(f"AI 分析加载失败：{e}")
 
 # ═══════════════════════════════════════════
 # 预测

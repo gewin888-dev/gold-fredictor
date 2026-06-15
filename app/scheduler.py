@@ -1,6 +1,7 @@
 import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -9,6 +10,7 @@ from app.auto_settings import resolved_auto_settings
 from app.data.cb_gold_collector import collect_central_bank_gold
 from app.data.cftc_collector import collect_cftc_gold_position
 from app.data.fred_collector import collect_fred_data
+from app.data.gold_price_collector import fetch_gold_history
 from app.data.market_structure_collector import collect_market_structure_data
 from app.data.sentiment_collector import collect_news_sentiment
 from app.data.sge_collector import collect_china_gold_premium
@@ -18,11 +20,16 @@ from app.monitoring.health import get_data_health
 from app.monitoring.threshold_alert import send_threshold_alerts
 from app.notifications.feishu import send_score_alert_with_health
 from app.scoring.gold_score import compute_and_store_gold_score, compute_and_store_gold_score_with_params
-from app.scoring.gold_predictor import evaluate_due_predictions, optimize_prediction_model_params, predict_gold_prices
+from app.scoring.gold_predictor import (
+    evaluate_due_predictions,
+    optimize_prediction_model_params,
+    predict_gold_prices,
+    rollback_degraded_prediction_model,
+)
 from app.scoring.score_optimizer import activate_version, get_active_params, optimize_score_params, save_best_params
 
 
-def _collect_sp500_snapshot(db: SessionLocal) -> None:
+def _collect_sp500_snapshot(db: Session) -> None:
     """从新浪采集标普 500 指数快照，存入 MacroObservation 表。"""
     import requests
     from datetime import datetime, timezone
@@ -54,10 +61,10 @@ def _collect_sp500_snapshot(db: SessionLocal) -> None:
         )
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集 SP500 快照失败", exc_info=True)
 
 
-def _collect_silver_snapshot(db: SessionLocal) -> None:
+def _collect_silver_snapshot(db: Session) -> None:
     """从新浪采集白银价格快照。"""
     import requests
     from datetime import datetime, timezone
@@ -79,10 +86,10 @@ def _collect_silver_snapshot(db: SessionLocal) -> None:
         stmt = stmt.on_conflict_do_update(index_elements=["series_id", "timestamp"], set_={"value": price, "source": "SINA"})
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集白银快照失败", exc_info=True)
 
 
-def _collect_gld_snapshot(db: SessionLocal) -> None:
+def _collect_gld_snapshot(db: Session) -> None:
     """从新浪采集 GLD ETF 价格快照。"""
     import requests
     from datetime import datetime, timezone
@@ -103,10 +110,10 @@ def _collect_gld_snapshot(db: SessionLocal) -> None:
         stmt = stmt.on_conflict_do_update(index_elements=["series_id", "timestamp"], set_={"value": price, "source": "SINA"})
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集 GLD ETF 快照失败", exc_info=True)
 
 
-def _collect_google_trend_snapshot(db: SessionLocal) -> None:
+def _collect_google_trend_snapshot(db: Session) -> None:
     """从 Google Trends 采集 gold price 搜索热度。"""
     from datetime import datetime, timezone
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -135,52 +142,62 @@ def _collect_google_trend_snapshot(db: SessionLocal) -> None:
             )
             db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集 Google Trends 快照失败", exc_info=True)
 
 
 def collect_and_score_job() -> None:
     """定时任务：采集所有数据 → 评分 → 阈值告警 → 每日报告推送。"""
+    # 先刷新金价日线（独立 DB 会话，失败不阻塞后续采集）
+    try:
+        fetch_gold_history(days=1)
+    except Exception:
+        logger.warning("金价日线刷新失败（已跳过，不中断整体流程）", exc_info=True)
+
     db = SessionLocal()
     try:
-        with serialized_write():
-            # 采集全部数据源（每个独立 try，单点失败不影响其他）
-            for name, collector in [
-                ("FRED", collect_fred_data),
-                ("CFTC", collect_cftc_gold_position),
-                ("中国溢价", collect_china_gold_premium),
-                ("央行购金", collect_central_bank_gold),
-                ("新闻情绪", collect_news_sentiment),
-                ("市场结构", collect_market_structure_data),
-                ("SP500", _collect_sp500_snapshot),
-                ("白银", _collect_silver_snapshot),
-                ("GLD_ETF", _collect_gld_snapshot),
-                ("搜索热度", _collect_google_trend_snapshot),
-                ("GDX", _collect_gdx_snapshot),
-                ("WTI", _collect_wti_snapshot),
-                ("铜", _collect_copper_snapshot),
-            ]:
-                try:
-                    collector(db)
-                except Exception:
-                    logger.warning("采集器 %s 失败（已跳过，不中断整体流程）", name, exc_info=True)
-
-            # 优先使用激活的优化参数
-            active_params = get_active_params(db)
-            if active_params is not None:
-                snapshot = compute_and_store_gold_score_with_params(db, active_params, source="optimized_active")
-            else:
-                snapshot = compute_and_store_gold_score(db)
-
-            # 记录一次预测快照，并评估已到期的历史预测。
-            predict_gold_prices(db, persist=True)
-            evaluate_due_predictions(db)
-
-            # 自动进化桥接：预测不准 → 搜索更优参数
+        # 采集全部数据源（每个独立 try，单点失败不影响其他）
+        for name, collector in [
+            ("FRED", collect_fred_data),
+            ("CFTC", collect_cftc_gold_position),
+            ("中国溢价", collect_china_gold_premium),
+            ("央行购金", collect_central_bank_gold),
+            ("新闻情绪", collect_news_sentiment),
+            ("市场结构", collect_market_structure_data),
+            ("SP500", _collect_sp500_snapshot),
+            ("白银", _collect_silver_snapshot),
+            ("GLD_ETF", _collect_gld_snapshot),
+            ("搜索热度", _collect_google_trend_snapshot),
+            ("GDX", _collect_gdx_snapshot),
+            ("WTI", _collect_wti_snapshot),
+            ("铜", _collect_copper_snapshot),
+        ]:
             try:
-                from app.auto_evolve import auto_evolve_if_needed
-                auto_evolve_if_needed(db)
+                collector(db)
             except Exception:
-                logger.debug("自动进化检查跳过", exc_info=True)
+                logger.warning("采集器 %s 失败（已跳过，不中断整体流程）", name, exc_info=True)
+
+        # 所有采集器完成后统一提交，写入操作受串行锁保护
+        with serialized_write():
+            db.commit()
+
+        # 优先使用激活的优化参数
+        active_params = get_active_params(db)
+        if active_params is not None:
+            snapshot = compute_and_store_gold_score_with_params(db, active_params, source="optimized_active")
+        else:
+            snapshot = compute_and_store_gold_score(db)
+
+        # 记录一次预测快照，并评估已到期的历史预测。
+        predict_gold_prices(db, persist=True)
+        evaluate_due_predictions(db)
+        rollback_degraded_prediction_model(db)
+
+        # 自动进化桥接：预测不准 → 搜索更优参数
+        try:
+            from app.auto_evolve import auto_evolve_if_needed
+            auto_evolve_if_needed(db)
+        except Exception:
+            logger.debug("自动进化检查跳过", exc_info=True)
 
         # 阈值告警（因子突变即时推送）
         send_threshold_alerts(db, snapshot)
@@ -213,20 +230,24 @@ def auto_optimize_job() -> None:
             return
 
         if settings["AUTO_OPTIMIZE_SCORE_PARAMS"]:
-            with serialized_write():
-                results = optimize_score_params(
-                    db,
-                    n_iter=int(settings["AUTO_OPTIMIZE_N_ITER"]),
-                    horizon_days=int(settings["AUTO_OPTIMIZE_HORIZON_DAYS"]),
-                )
-                if not results or not results[0].get("ok"):
-                    results = []
+            # 参数搜索（纯计算，不持锁）
+            results = optimize_score_params(
+                db,
+                n_iter=int(settings["AUTO_OPTIMIZE_N_ITER"]),
+                horizon_days=int(settings["AUTO_OPTIMIZE_HORIZON_DAYS"]),
+            )
+            if not results or not results[0].get("ok"):
+                results = []
 
-                if results:
-                    best = results[0]
-                    from datetime import datetime, timezone
+            if results:
+                best = results[0]
+                from datetime import datetime, timezone
 
-                    version = f"auto_opt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+                version = f"auto_opt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}"
+                hit_rate = best.get("hit_rate")
+                activation_check = best.get("activation_check") or {}
+                # 仅写库操作持锁
+                with serialized_write():
                     saved = save_best_params(
                         db,
                         best,
@@ -234,8 +255,6 @@ def auto_optimize_job() -> None:
                         horizon_days=int(settings["AUTO_OPTIMIZE_HORIZON_DAYS"]),
                         notes="定时任务生成的候选评分参数；默认仅保存，达到阈值且显式授权后才自动激活。",
                     )
-                    hit_rate = best.get("hit_rate")
-                    activation_check = best.get("activation_check") or {}
                     if (
                         settings["AUTO_ACTIVATE_OPTIMIZED_PARAMS"]
                         and hit_rate is not None
@@ -247,22 +266,25 @@ def auto_optimize_job() -> None:
                         activate_version(db, version)
 
         if settings["AUTO_OPTIMIZE_PREDICTION_MODEL"]:
-            with serialized_write():
-                optimize_prediction_model_params(
-                    db,
-                    n_iter=int(settings["AUTO_PREDICTION_N_ITER"]),
-                    top_k=5,
-                    random_seed=42,
-                    save_best=True,
-                    auto_activate=bool(settings["AUTO_ACTIVATE_PREDICTION_MODEL"]),
-                    activation_thresholds={
-                        "min_score": settings["AUTO_PREDICTION_MIN_SCORE"],
-                        "max_mape_price_pct": settings["AUTO_PREDICTION_MAX_MAPE_PCT"],
-                        "min_direction_accuracy": settings["AUTO_PREDICTION_MIN_DIRECTION_ACCURACY"],
-                        "min_samples": settings["AUTO_PREDICTION_MIN_SAMPLES"],
-                        "min_valid_horizons": settings["AUTO_PREDICTION_MIN_VALID_HORIZONS"],
-                    },
-                )
+            # 预测模型搜索同样先跑计算，再持锁写库
+            optimize_prediction_model_params(
+                db,
+                n_iter=int(settings["AUTO_PREDICTION_N_ITER"]),
+                top_k=5,
+                random_seed=42,
+                save_best=True,
+                auto_activate=bool(settings["AUTO_ACTIVATE_PREDICTION_MODEL"]),
+                activation_thresholds={
+                    "min_score": settings["AUTO_PREDICTION_MIN_SCORE"],
+                    "max_mape_price_pct": settings["AUTO_PREDICTION_MAX_MAPE_PCT"],
+                    "min_direction_accuracy": settings["AUTO_PREDICTION_MIN_DIRECTION_ACCURACY"],
+                    "min_samples": settings["AUTO_PREDICTION_MIN_SAMPLES"],
+                    "min_valid_horizons": 3,
+                    "min_baseline_lift": 0.03,
+                    "max_mape_worse_ratio": 1.2,
+                    "max_recent_degradation": 0.05,
+                },
+            )
     finally:
         db.close()
 
@@ -277,6 +299,9 @@ def create_scheduler() -> BackgroundScheduler:
         hour="*",
         minute=5,
         id="hourly_collect_and_score",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
 
     # 央行购金：每 15 天执行一次（UTC 周一 08:00）
@@ -287,6 +312,9 @@ def create_scheduler() -> BackgroundScheduler:
         hour=8,
         minute=0,
         id="cb_gold_15day",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
     )
 
     # 每日完整报告（北京时间早 6 点）
@@ -296,6 +324,9 @@ def create_scheduler() -> BackgroundScheduler:
         hour=22,
         minute=0,
         id="daily_full_report",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
     )
 
     # 每周自我优化候选参数；默认由 AUTO_OPTIMIZE_SCORE_PARAMS 控制，不会擅自激活。
@@ -306,12 +337,15 @@ def create_scheduler() -> BackgroundScheduler:
         hour=21,
         minute=30,
         id="weekly_auto_optimize",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
     )
 
     return scheduler
 
 
-def _collect_gdx_snapshot(db: SessionLocal) -> None:
+def _collect_gdx_snapshot(db: Session) -> None:
     import requests
     from datetime import datetime, timezone
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -330,10 +364,10 @@ def _collect_gdx_snapshot(db: SessionLocal) -> None:
         stmt = stmt.on_conflict_do_update(index_elements=["series_id", "timestamp"], set_={"value": price, "source": "SINA"})
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集 GDX 快照失败", exc_info=True)
 
 
-def _collect_wti_snapshot(db: SessionLocal) -> None:
+def _collect_wti_snapshot(db: Session) -> None:
     import requests
     from datetime import datetime, timezone
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -352,10 +386,10 @@ def _collect_wti_snapshot(db: SessionLocal) -> None:
         stmt = stmt.on_conflict_do_update(index_elements=["series_id", "timestamp"], set_={"value": price, "source": "SINA"})
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集 WTI 快照失败", exc_info=True)
 
 
-def _collect_copper_snapshot(db: SessionLocal) -> None:
+def _collect_copper_snapshot(db: Session) -> None:
     import requests
     from datetime import datetime, timezone
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -374,4 +408,4 @@ def _collect_copper_snapshot(db: SessionLocal) -> None:
         stmt = stmt.on_conflict_do_update(index_elements=["series_id", "timestamp"], set_={"value": price, "source": "SINA"})
         db.execute(stmt)
     except Exception:
-        pass
+        logger.warning("采集铜价快照失败", exc_info=True)
