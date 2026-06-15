@@ -414,7 +414,7 @@ def health_recorder(db: Session = Depends(get_db)) -> dict[str, object]:
 def health_collectors() -> dict[str, object]:
     """采集器健康检查：所有数据源的成功/失败/新鲜度状态。"""
     from app.monitoring.collector_health import get_health_summary
-    return get_health_summary()
+    return {"ok": True, **get_health_summary()}
 
 @app.get("/gold/price")
 def gold_price() -> dict[str, object]:

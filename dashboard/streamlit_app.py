@@ -854,7 +854,7 @@ with st.expander(health_label, expanded=False):
 # ── 采集器健康 + AI 洞察（主动可查）──
 try:
     collector_health = api("/health/collectors")
-    if collector_health.get("ok"):
+    if collector_health and collector_health.get("summary"):
         summary = collector_health.get("summary", {})
         critical_issues = summary.get("critical_issues", [])
         healthy = summary.get("healthy", 0)
