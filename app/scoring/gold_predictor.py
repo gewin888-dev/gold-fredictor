@@ -39,6 +39,33 @@ HORIZONS = [1, 7, 30, 90, 180, 360]
 EVOLUTION_HORIZONS = [1, 7, 30]
 MIN_RETURN_SAMPLES = 20
 EXCLUDED_TRAINING_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
+
+# 通配符：表示使用所有非排除源的真实数据
+ALL_SOURCES_WILDCARD = "*"
+
+
+def _is_trainable_source(source: str | None) -> bool:
+    """判断评分源是否可用于预测训练。排除 SAMPLE/ESTIMATE/MANUAL/JSON 等非真实数据。"""
+    return (source or "").strip().upper() not in EXCLUDED_TRAINING_SOURCES
+
+
+def _filter_trainable_scores(all_scores_df: pd.DataFrame,
+                              allowed_sources: set[str]) -> pd.DataFrame:
+    """从全部评分中筛选可用于训练的行。
+
+    allowed_sources 包含 "*" 时，使用所有非排除源。
+    否则只保留来源在 allowed_sources 中的行。
+    """
+    if ALL_SOURCES_WILDCARD in allowed_sources:
+        mask = all_scores_df["source"].astype(str).apply(_is_trainable_source)
+    else:
+        mask = (
+            all_scores_df["source"].astype(str).isin(allowed_sources)
+            & all_scores_df["source"].astype(str).str.upper().apply(
+                lambda s: s not in EXCLUDED_TRAINING_SOURCES
+            )
+        )
+    return all_scores_df[mask].copy()
 DEFAULT_MODEL_VERSION = "predictor_v2_baseline"
 
 # 宏观指标 ID
@@ -216,11 +243,7 @@ def _prediction_training_context(db: Session) -> dict[str, Any]:
         for r in score_rows
     ])
     allowed_sources = configured_prediction_sources()
-    sources_upper = all_scores_df["source"].astype(str).str.upper()
-    scores_df = all_scores_df[
-        all_scores_df["source"].astype(str).isin(allowed_sources)
-        & ~sources_upper.isin(EXCLUDED_TRAINING_SOURCES)
-    ].copy()
+    scores_df = _filter_trainable_scores(all_scores_df, allowed_sources)
 
     gold_rows = db.scalars(select(GoldPrice).order_by(GoldPrice.date.asc())).all()
     if not gold_rows:
@@ -234,7 +257,7 @@ def _prediction_training_context(db: Session) -> dict[str, Any]:
     if scores_df.empty or gold_df.empty:
         return {
             "ok": False,
-            "reason": "insufficient trusted v2 score data",
+            "reason": "insufficient trainable score data",
             "required_score_sources": sorted(allowed_sources),
             "available_score_sources": sorted(all_scores_df["source"].astype(str).unique().tolist()),
         }
@@ -315,7 +338,10 @@ def predict_gold_prices(db: Session, persist: bool = False) -> dict[str, Any]:
         )
 
     # ── 统计 ──
-    allowed_count = int(all_scores_df["source"].astype(str).isin(allowed_sources).sum())
+    if ALL_SOURCES_WILDCARD in allowed_sources:
+        allowed_count = int(all_scores_df["source"].astype(str).apply(_is_trainable_source).sum())
+    else:
+        allowed_count = int(all_scores_df["source"].astype(str).isin(allowed_sources).sum())
     total_count = len(all_scores_df)
     excluded_count = total_count - allowed_count
 

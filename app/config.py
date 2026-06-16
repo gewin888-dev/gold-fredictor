@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     production_mode: bool = Field(default=True, alias="PRODUCTION_MODE")
     show_low_confidence_data: bool = Field(default=False, alias="SHOW_LOW_CONFIDENCE_DATA")
     prediction_score_sources: str = Field(
-        default="backfill_real_v2,rule_v2",
+        default="*",
         alias="PREDICTION_SCORE_SOURCES",
     )
     auto_optimize_score_params: bool = Field(default=False, alias="AUTO_OPTIMIZE_SCORE_PARAMS")

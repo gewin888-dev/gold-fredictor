@@ -8,6 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import configured_prediction_sources
+
+ALL_SOURCES_WILDCARD = "*"
+EXCLUDED_TRAINING_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
 from app.data.utils import gold_price_frame
 from app.models import GoldPrice, GoldScoreSnapshot
 
@@ -36,6 +39,10 @@ def _score_frame(db: Session, score_sources: set[str] | None = None) -> pd.DataF
     if frame.empty:
         return frame
     allowed = score_sources or configured_prediction_sources()
+    if ALL_SOURCES_WILDCARD in allowed:
+        return frame[
+            ~frame["source"].astype(str).str.upper().isin(EXCLUDED_TRAINING_SOURCES)
+        ].copy()
     return frame[frame["source"].isin(allowed)].copy()
 
 
