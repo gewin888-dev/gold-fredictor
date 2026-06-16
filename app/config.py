@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     newsapi_key: str = Field(default="", alias="NEWSAPI_KEY")
     newsapi_daily_limit: int = Field(default=100, alias="NEWSAPI_DAILY_LIMIT")
     newsapi_timeout_seconds: int = Field(default=12, alias="NEWSAPI_TIMEOUT_SECONDS")
+    newsapi_verify_ssl: bool = Field(default=True, alias="NEWSAPI_VERIFY_SSL")
     fred_observation_start: str = Field(default="2018-01-01", alias="FRED_OBSERVATION_START")
     fred_verify_ssl: bool = Field(default=True, alias="FRED_VERIFY_SSL")
     auto_start_scheduler: bool = Field(default=False, alias="AUTO_START_SCHEDULER")

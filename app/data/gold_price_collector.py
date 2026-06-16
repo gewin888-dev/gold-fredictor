@@ -50,6 +50,7 @@ def fetch_gold_history(days: int = 200, ticker: str = GOLD_TICKER) -> list[dict[
     兜底：用 Sina 实时报价更新当日记录。
 
     返回: 采集到的记录数。
+    完全失败时抛出 RuntimeError 让调度器记录失败。
     """
     from datetime import datetime as dt
 
@@ -77,7 +78,14 @@ def fetch_gold_history(days: int = 200, ticker: str = GOLD_TICKER) -> list[dict[
         pass  # Sina 日线 API 不可用，走兜底
 
     # 2) 兜底：用实时报价更新当日记录
-    return _update_today_from_sina()
+    result = _update_today_from_sina()
+    if result and len(result) > 0:
+        first = result[0]
+        if isinstance(first, dict) and first.get("ok"):
+            return result
+        # 兜底也失败，抛出异常
+        raise RuntimeError(f"All Sina sources failed: {first.get('error', 'unknown') if isinstance(first, dict) else str(first)}")
+    raise RuntimeError("Gold price fetch failed: no data from any source")
 
 
 def _fetch_from_db() -> dict[str, Any]:
@@ -437,10 +445,14 @@ def record_intraday_snapshot() -> dict[str, Any]:
     try:
         result = _fetch_from_sina()
         if not result.get("ok"):
+            from app.monitoring.collector_health import record_failure
+            record_failure("intraday_snapshot", f"Sina fetch failed: {result.get('error', 'unknown')}")
             return result
 
         price = result.get("price")
         if price is None:
+            from app.monitoring.collector_health import record_failure
+            record_failure("intraday_snapshot", "No price from Sina")
             return {"ok": False, "error": "No price from Sina"}
 
         high = result.get("day_high")
@@ -468,6 +480,8 @@ def record_intraday_snapshot() -> dict[str, Any]:
             db.execute(delete(IntradaySnapshot).where(IntradaySnapshot.timestamp < cutoff))
 
             db.commit()
+            from app.monitoring.collector_health import record_success
+            record_success("intraday_snapshot", f"recorded at {price}")
             return {"ok": True, "recorded_at": now.isoformat(), "price": price}
         except Exception:
             db.rollback()
@@ -475,6 +489,8 @@ def record_intraday_snapshot() -> dict[str, Any]:
         finally:
             db.close()
     except Exception as e:
+        from app.monitoring.collector_health import record_failure
+        record_failure("intraday_snapshot", str(e)[:200])
         return {"ok": False, "error": str(e)}
 
 
@@ -487,19 +503,19 @@ RECORD_INTERVAL_SECONDS = 60  # 每 60 秒记录一次
 
 def _intraday_recorder_loop():
     """后台线程：周期性记录金价快照。"""
+    from app.monitoring.collector_health import record_failure
+
     while not _recorder_stop.is_set():
         try:
             # 仅在美国期货交易时段活跃（避免非交易时段记录无用数据）
             # COMEX: 周日 18:00 - 周五 17:00 ET = UTC-4/5
             now = datetime.now(timezone.utc)
-            weekday = now.weekday()  # 0=Mon, 6=Sun
-            hour = now.hour
 
             # COMEX 活跃时段约为周日 22:00 UTC - 周五 21:00 UTC。
             if not is_comex_market_closed(now):
                 record_intraday_snapshot()
-        except Exception:
-            pass  # 静默处理，不中断线程
+        except Exception as e:
+            record_failure("intraday_snapshot", f"recorder loop error: {str(e)[:200]}")
         _recorder_stop.wait(RECORD_INTERVAL_SECONDS)
 
 

@@ -103,6 +103,7 @@ def collect_news_sentiment(
             NEWSAPI_URL, params=params,
             headers={"User-Agent": "gold-fredictor/1.0"},
             timeout=settings.newsapi_timeout_seconds,
+            verify=settings.newsapi_verify_ssl,
         )
         resp.raise_for_status()
         data = resp.json()
