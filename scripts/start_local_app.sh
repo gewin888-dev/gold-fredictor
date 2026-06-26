@@ -14,6 +14,10 @@ if [[ ! -x "$PYTHON" || ! -x "$UVICORN" || ! -x "$STREAMLIT" ]]; then
 fi
 
 mkdir -p logs .runtime
+OPEN_BROWSER=true
+if [[ "${1:-}" == "--no-open" || "${GOLD_FREDICTOR_NO_OPEN:-}" == "1" ]]; then
+  OPEN_BROWSER=false
+fi
 
 "$PYTHON" scripts/system_health_check.py >/tmp/gold_fredictor_health.json || true
 
@@ -57,7 +61,9 @@ if ! lsof -iTCP:8501 -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 sleep 2
-open "http://127.0.0.1:8501"
+if [[ "$OPEN_BROWSER" == "true" ]]; then
+  open "http://127.0.0.1:8501"
+fi
 echo "Gold Fredictor is running:"
 echo "  Dashboard: http://127.0.0.1:8501"
 echo "  API docs:  http://127.0.0.1:8000/docs"

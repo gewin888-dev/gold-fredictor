@@ -32,6 +32,7 @@ cp .env.example .env
 
 编辑 `.env`，填入 `FRED_API_KEY` 和 `NEWSAPI_KEY`。如果暂时没有飞书机器人，可保持 `FEISHU_WEBHOOK_URL` 为空。
 后期维护、配置审计和排障流程见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+桌面 App 使用说明见 [docs/DESKTOP_APP.md](docs/DESKTOP_APP.md)。
 
 默认情况下，API 启动只建表，不会自动联网采集或启动后台调度器。需要自动启动时可在 `.env` 设置：
 
@@ -87,6 +88,19 @@ python scripts/send_score_alert.py
 
 ```bash
 streamlit run dashboard/streamlit_app.py
+```
+
+启动桌面 App：
+
+```bash
+npm install
+npm run app
+```
+
+打包本机 App：
+
+```bash
+npm run app:pack
 ```
 
 可选启动 API：
