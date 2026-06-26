@@ -40,7 +40,7 @@ def test_build_score_alert_text_contains_analysis_fields():
     assert "黄金趋势" in text
     assert "CFTC 非商业净持仓" in text
     assert "美国 CPI 数据" in text
-    assert "不构成投资建议" in text
+    assert "不用于黄金买卖参考" in text
 
 
 def test_send_score_alert_with_health_skips_without_webhook(monkeypatch):

@@ -826,7 +826,7 @@ def optimize_prediction_model_params(
 ) -> dict[str, Any]:
     """生成候选预测模型参数，并用 walk-forward 多 horizon 指标排序。
 
-    只保存候选版本，不自动激活。后续需调用 /predict/models/{version}/activate。
+    可按 auto_activate 和严格质量门控自动激活；未达标时只保存候选供复盘。
     """
     context = _prediction_training_context(db)
     if not context.get("ok"):
@@ -904,7 +904,10 @@ def optimize_prediction_model_params(
         "baseline": _compact_optimization_result(baseline) if baseline else None,
         "top": [_compact_optimization_result(item) for item in results[:max(1, top_k)]],
         "message": (
-            f"Saved candidate model {saved_version}. Activate manually after review."
+            (
+                f"Saved candidate model {saved_version}. "
+                f"{'Auto-activated after passing quality gates.' if activation.get('activated') else 'Waiting for quality gates before activation.'}"
+            )
             if saved_version else "Optimization completed without saving a candidate."
         ),
         "reason": reason,
@@ -1180,7 +1183,7 @@ def save_prediction_model_candidate(db: Session, result: dict[str, Any]) -> Pred
         notes=(
             "候选预测模型，基于 1/7/30 天短周期方向命中率 walk-forward 自动搜索生成；"
             f"score={result.get('optimization_score')}, "
-            f"valid_horizons={result.get('valid_horizons')}。默认不自动激活。"
+            f"valid_horizons={result.get('valid_horizons')}。按自动门控策略处理。"
         ),
     )
     db.add(record)

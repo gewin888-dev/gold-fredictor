@@ -24,6 +24,7 @@ from app.backtesting.score_backtest import run_score_backtest
 from app.events.calendar import list_macro_events
 from app.models import CftcPosition, ExternalMarketIndicator, GoldScoreSnapshot, MacroObservation, MacroSeries
 from app.monitoring.health import get_data_health
+from app.monitoring.system_health import get_system_health
 from app.scoring.gold_score import compute_and_store_gold_score
 from app.scoring.factor_registry import factor_groups as registry_factor_groups
 from app.scoring.factor_registry import factor_help as registry_factor_help
@@ -34,7 +35,8 @@ import httpx
 st.set_page_config(page_title="黄金走势监控", layout="wide", initial_sidebar_state="expanded")
 SETTINGS = get_settings()
 LOW_CONFIDENCE_SOURCES = {"SAMPLE", "ESTIMATE", "MANUAL", "JSON"}
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = SETTINGS.dashboard_api_base_url.rstrip("/")
+LOCAL_HTTP_KW = {"trust_env": False}
 
 st.markdown("""
 <style>
@@ -355,7 +357,7 @@ def _ago(ts_str: str) -> str:
 def api(path: str, method: str = "get", **kw) -> dict:
     """调用 FastAPI 端点"""
     try:
-        with httpx.Client(timeout=httpx.Timeout(15)) as c:
+        with httpx.Client(timeout=httpx.Timeout(15), **LOCAL_HTTP_KW) as c:
             fn = getattr(c, method.lower())
             base = API_BASE_URL
             r = fn(f"{base}{path}", **kw)
@@ -372,11 +374,7 @@ def api(path: str, method: str = "get", **kw) -> dict:
 
 @st.cache_data(ttl=25)
 def get_gold() -> dict:
-    try:
-        with httpx.Client(timeout=httpx.Timeout(10)) as c:
-            r = c.get(f"{API_BASE_URL}/gold/price")
-            return r.json() if r.status_code == 200 else {}
-    except Exception:
+    def from_local_db() -> dict:
         db = SessionLocal()
         try:
             from app.models import GoldPrice as GP
@@ -384,14 +382,32 @@ def get_gold() -> dict:
             if not row:
                 return {}
             return {
-                "ok": True, "price": row.close,
-                "previous_close": None, "change": None, "change_pct": None,
-                "day_high": row.high, "day_low": row.low,
+                "ok": True,
+                "ticker": "DB/GoldPrice",
+                "price": row.close,
+                "previous_close": None,
+                "change": None,
+                "change_pct": None,
+                "day_high": row.high,
+                "day_low": row.low,
                 "timestamp": row.date.isoformat() if row.date else "",
-                "source": row.source, "freshness": "stale",
+                "source": row.source or "database",
+                "freshness": "stale",
             }
         finally:
             db.close()
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10), **LOCAL_HTTP_KW) as c:
+            r = c.get(f"{API_BASE_URL}/gold/price")
+            if r.status_code != 200:
+                return from_local_db()
+            data = r.json()
+            if data.get("ok") and data.get("price"):
+                return data
+            return from_local_db()
+    except Exception:
+        return from_local_db()
 
 
 @st.cache_data(ttl=25)
@@ -559,6 +575,17 @@ def get_health() -> dict:
                 return {"ok": False, "error": str(e), "items": []}
         finally:
             db.close()
+
+
+@st.cache_data(ttl=40)
+def get_system_health_payload() -> dict:
+    db = SessionLocal()
+    try:
+        return get_system_health(db)
+    except Exception as e:
+        return {"ok": False, "status": "BROKEN", "error": str(e), "components": {}}
+    finally:
+        db.close()
 
 
 @st.cache_data(ttl=60)
@@ -733,7 +760,7 @@ def _intraday_coverage_label(df: pd.DataFrame) -> tuple[str, list[str]]:
 st.markdown(
     """<div class="hero">
       <div class="hero-title">黄金走势实时监控与预测系统</div>
-      <div class="hero-subtitle">宏观利率、美元、持仓、事件和情绪的综合监控面板。仅用于数据分析和风险提示，不构成投资建议。</div>
+      <div class="hero-subtitle">宏观利率、美元、持仓、事件和情绪的综合监控面板。用于验证 AI 系统能否对标真实黄金走势，不用于黄金买卖参考。</div>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -767,39 +794,76 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
-    st.markdown("### ⚙️ 自动优化")
+    st.markdown("### ⚙️ 自动驾驶")
     auto_config = api("/settings/auto-optimize")
     auto_settings = auto_config.get("settings", {})
-    new_score = st.toggle("评分参数自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS", False))
-    new_activate = st.toggle("达标自动激活", value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", False))
-    new_pred = st.toggle("预测模型自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", False))
-    new_pred_activate = st.toggle("预测模型自动激活", value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", False))
-    # 检测是否有未保存更改
-    if "_auto_initial" not in st.session_state:
-        st.session_state["_auto_initial"] = dict(auto_settings)
+    new_full_auto = st.toggle(
+        "实验全自动进化",
+        value=auto_settings.get("AUTO_EVOLUTION_FULL_AUTO", True),
+        help="用于验证 AI 零代码开发预测系统的可行性。开启后无人值守运行，但不降低准确性门槛：仍按样本量、命中率、MAPE、基线提升和退化检查自动判定。",
+    )
+    new_healing = st.toggle(
+        "自动评估与修复",
+        value=auto_settings.get("AUTO_SELF_HEALING_ENABLED", True),
+        help="建议日常开启。系统会自动评估到期预测、检查退化模型、补做评分/预测快照，并记录自愈结果。",
+    )
+    new_autofix = st.toggle(
+        "达标后自动修正",
+        value=auto_settings.get("AUTO_SELF_HEALING_AUTOFIX", True),
+        help="建议在数据质量稳定后开启。只有通过样本量、命中率、误差、退化检查等门控后，才允许自动修正或回滚；关闭时只评估和记录，不自动改动。",
+    )
+    with st.expander("高级模型开关", expanded=False):
+        st.caption("实验全自动模式不会放宽质量标准；候选版本必须通过严格门控才会自动激活。")
+        new_score = st.toggle(
+            "评分参数自动搜索",
+            value=auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS", False),
+            help="开启后，定时任务会搜索新的多空评分参数候选；只生成候选，不等于自动使用。",
+        )
+        new_activate = st.toggle(
+            "评分参数达标激活",
+            value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", False),
+            help="仅在评分参数自动搜索开启且候选通过命中率、样本量和质量门控后，才会自动激活。",
+        )
+        new_pred = st.toggle(
+            "预测模型自动搜索",
+            value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", False),
+            help="开启后，定时任务会搜索新的预测模型参数候选；计算成本更高，建议有足够评估样本后再开。",
+        )
+        new_pred_activate = st.toggle(
+            "预测模型达标激活",
+            value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", False),
+            help="仅在预测模型自动搜索开启且候选通过方向准确率、MAPE、样本量、基线提升和近期退化门控后，才会自动激活。",
+        )
     current_toggle = {
+        "AUTO_EVOLUTION_FULL_AUTO": new_full_auto,
+        "AUTO_SELF_HEALING_ENABLED": new_healing,
+        "AUTO_SELF_HEALING_AUTOFIX": new_autofix,
         "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
         "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
         "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
         "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
     }
+    # 只比较页面可编辑项，避免后端其它配置键导致“未保存”误报。
+    if "_auto_initial" not in st.session_state:
+        st.session_state["_auto_initial"] = dict(current_toggle)
     has_unsaved = current_toggle != st.session_state["_auto_initial"]
     save_label = "💾 保存" + (" ●" if has_unsaved else "")
     if st.button(save_label, use_container_width=True):
         r = api("/settings/auto-optimize", "post", json={
+            "AUTO_EVOLUTION_FULL_AUTO": new_full_auto,
+            "AUTO_SELF_HEALING_ENABLED": new_healing,
+            "AUTO_SELF_HEALING_AUTOFIX": new_autofix,
             "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
             "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
             "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
             "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
         })
         if r.get("ok"):
-            st.session_state["_auto_initial"] = current_toggle
+            st.session_state["_auto_initial"] = dict(current_toggle)
             st.success("已保存")
             st.rerun()
     st.divider()
-    saved = st.session_state.get("_auto_saved", auto_settings)
-    pred_auto_text = "预测候选达标后受控自动激活" if saved.get("AUTO_ACTIVATE_PREDICTION_MODEL") else "预测候选仅生成，不自动激活"
-    st.caption(pred_auto_text)
+    st.caption("当前模式：AI 可行性验证全自动 + 严格质量门控。系统无人值守运行，但不降低准确性要求。")
     st.divider()
 
     # ── API 密钥配置 ──
@@ -898,28 +962,50 @@ with st.expander(health_label, expanded=False):
     for reason in health_payload.get("reasons", []):
         st.caption(f"• {reason}")
 
-# ── 采集器健康 + AI 洞察（主动可查）──
+# ── 系统健康 + AI 洞察（主动可查）──
 try:
-    collector_health = api("/health/collectors")
-    if collector_health and collector_health.get("summary"):
-        summary = collector_health.get("summary", {})
-        critical_issues = summary.get("critical_issues", [])
-        healthy = summary.get("healthy", 0)
-        total = summary.get("total", 0)
-        overall = collector_health.get("overall", "healthy")
-        status_icon = {"healthy": "✅", "degraded": "⚠️", "critical": "🔴", "initializing": "🔄"}.get(overall, "❓")
-        status_label = f"{status_icon} 系统健康：{healthy}/{total} 采集器正常"
+    system_payload = get_system_health_payload()
+    components = system_payload.get("components", {})
+    collector_health = components.get("collectors") or {}
+    summary = collector_health.get("summary", {})
+    healthy = summary.get("healthy", 0)
+    total = summary.get("total", 0)
+    system_status = system_payload.get("status", "UNKNOWN")
+    production_grade = system_payload.get("production_grade", False)
+    status_icon = {
+        "HEALTHY": "✅",
+        "DEGRADED": "⚠️",
+        "RISKY": "🟠",
+        "BROKEN": "🔴",
+        "RESEARCH_ONLY": "🧪",
+    }.get(system_status, "❓")
+    grade_label = "生产级" if production_grade else "需复核"
+    status_label = f"{status_icon} 系统健康：{system_status} · {grade_label} · {healthy}/{total} 采集器正常"
 
-        with st.expander(status_label, expanded=False):
-            # 每个采集器状态
-            for c in collector_health.get("collectors", []):
-                s_icon = {"healthy": "✅", "degraded": "⚠️", "stale": "🕐", "no_data": "❌"}.get(c["status"], "❓")
-                age = f"{c['age_hours']:.1f}h" if c.get("age_hours") is not None else "从未"
-                err = f" — {c['last_error'][:60]}" if c.get("last_error") else ""
-                st.caption(f"{s_icon} {c['label']}：{c['status']}（{age}）{err}")
-            if st.button("🔄 检查采集器", key="check_collectors_btn"):
-                api("/ai/action", "post", params={"action": "检查采集器"})
-                st.rerun()
+    with st.expander(status_label, expanded=(system_status == "BROKEN")):
+        col_a, col_b, col_c, col_d, col_e = st.columns(5)
+        col_a.metric("数据健康", (components.get("data") or {}).get("status", "unknown"))
+        col_b.metric("日内记录器", (components.get("recorder") or {}).get("status", "unknown"))
+        col_c.metric("预测闭环", (components.get("prediction") or {}).get("status", "unknown"))
+        col_d.metric("外部指标", (components.get("external_indicators") or {}).get("status", "unknown"))
+        col_e.metric("自动驾驶", (components.get("self_healing") or {}).get("status", "unknown"))
+        st.caption(system_payload.get("message", ""))
+        issue_collectors = [
+            c for c in collector_health.get("collectors", [])
+            if c.get("status") not in {"healthy"}
+        ]
+        if issue_collectors:
+            st.caption("需要关注的采集器：")
+        else:
+            st.caption("核心采集器运行正常。")
+        for c in issue_collectors:
+            s_icon = {"healthy": "✅", "degraded": "⚠️", "stale": "🕐", "no_data": "❌"}.get(c["status"], "❓")
+            age = f"{c['age_hours']:.1f}h" if c.get("age_hours") is not None else "从未"
+            err = f" — {c['last_error'][:60]}" if c.get("last_error") else ""
+            st.caption(f"{s_icon} {c['label']}：{c['status']}（{age}）{err}")
+        if st.button("🔄 检查采集器", key="check_collectors_btn"):
+            api("/ai/action", "post", params={"action": "检查采集器"})
+            st.rerun()
 except Exception:
     pass
 
@@ -1433,20 +1519,36 @@ st.divider()
 st.markdown('<a id="gold-predict"></a>', unsafe_allow_html=True)
 st.subheader("金价预测")
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=15)
 def get_prediction() -> tuple[dict, str]:
     """返回 (data_dict, error_msg)。error_msg 为空时表示成功。"""
+    def from_local_db() -> tuple[dict, str]:
+        db = SessionLocal()
+        try:
+            from app.scoring.gold_predictor import predict_gold_prices
+            data = predict_gold_prices(db)
+            if data.get("ok"):
+                data["degraded_source"] = "local_db"
+                return data, ""
+            return data, data.get("reason", "本地预测不可用")
+        except Exception as e:
+            return {}, f"本地预测降级失败：{e}"
+        finally:
+            db.close()
+
     try:
-        with httpx.Client(timeout=httpx.Timeout(45)) as c:
+        with httpx.Client(timeout=httpx.Timeout(45), **LOCAL_HTTP_KW) as c:
             r = c.get(f"{API_BASE_URL}/predict/gold")
             if r.status_code != 200:
-                return {}, f"API 返回状态 {r.status_code}"
+                return from_local_db()
             data = r.json()
             if not data.get("ok"):
-                return data, data.get("reason", "未知错误")
+                local_data, local_error = from_local_db()
+                return (local_data, "") if local_data.get("ok") else (data, data.get("reason", local_error or "未知错误"))
             return data, ""
     except Exception as e:
-        return {}, f"连接后端失败：{e}"
+        local_data, local_error = from_local_db()
+        return (local_data, "") if local_data.get("ok") else ({}, f"连接后端失败：{e}；{local_error}")
 
 
 @st.cache_data(ttl=60)
@@ -1475,6 +1577,8 @@ if pred.get("ok"):
         "短期动量+评分回归，长期宏观基准+调整。"
         f"  UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M')}"
     )
+    if pred.get("degraded_source") == "local_db":
+        st.caption("预测服务使用本地数据库降级结果；实时 API 不可用时仍可查看最近入库数据推导。")
     st.caption(
         f"预测闭环状态：已评估 {evaluated_count} 条，到期待评估 {due_pending_count} 条，"
         f"待到期 {future_pending_count} 条。{due_status.get('message', '')}"
@@ -1521,7 +1625,7 @@ if pred.get("ok"):
             best = opt_result.get("best") or {}
             activation = opt_result.get("activation") or {}
             overfit = activation.get("overfit_risk") or {}
-            mode = "已自动激活" if activation.get("activated") else "等待人工激活"
+            mode = "已自动激活" if activation.get("activated") else "等待自动门控"
             st.success(
                 f"已生成候选模型 {opt_result.get('saved_version')}："
                 f"综合分 {best.get('optimization_score')}，"
@@ -2111,6 +2215,7 @@ with st.expander("评分模型自我进化", expanded=False):
                     f"{API_BASE_URL}/score/optimize",
                     params={"n_iter": n_iter, "horizon_days": horizon_days},
                     timeout=httpx.Timeout(600),
+                    trust_env=False,
                 )
                 r = resp.json() if resp.status_code == 200 else {}
             except Exception:
@@ -2159,7 +2264,7 @@ with st.expander("评分模型自我进化", expanded=False):
                 rr = api(
                     f"/score/params/{active_ver}/activate",
                     "post",
-                    json={"operator": "dashboard", "reason": "人工审核后在仪表盘激活"},
+                    json={"operator": "dashboard", "reason": "仪表盘调试覆盖激活"},
                 )
                 if rr.get("ok"):
                     st.success(f"已激活 {active_ver}")
@@ -2175,7 +2280,7 @@ with st.expander("评分模型自我进化", expanded=False):
                 rr = api(
                     "/score/params/deactivate",
                     "post",
-                    json={"operator": "dashboard", "reason": "人工恢复默认评分规则"},
+                    json={"operator": "dashboard", "reason": "仪表盘调试覆盖恢复默认评分规则"},
                 )
                 if rr.get("ok"):
                     st.success("已恢复默认规则 v2")
@@ -2232,7 +2337,7 @@ if audits.get("ok") and audits.get("data"):
 
 st.divider()
 st.caption(
-    "本系统仅提供数据分析和风险提示，不构成任何投资建议。"
+    "本系统用于验证 AI 黄金预测系统可行性，不用于黄金买卖参考。"
     f" 数据刷新间隔 {st.session_state['_rf_interval']}s · "
     f"UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
 )

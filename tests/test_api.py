@@ -160,6 +160,32 @@ def test_auto_optimize_settings_endpoint_uses_safe_db_settings(db_session):
     assert "health" in after.json()
 
 
+def test_config_audit_masks_secrets_and_marks_db_overrides(db_session):
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        client.post(
+            "/settings/auto-optimize",
+            json={"AUTO_SELF_HEALING_ENABLED": False},
+        )
+        response = client.get("/config/audit")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    items = {row["key"]: row for row in payload["items"]}
+    assert items["FRED_API_KEY"]["is_secret"] is True
+    assert items["FRED_API_KEY"]["value"] in {"", "***"} or "***" in items["FRED_API_KEY"]["value"]
+    assert items["AUTO_SELF_HEALING_ENABLED"]["source"] == "database"
+    assert items["AUTO_SELF_HEALING_ENABLED"]["hot_reload"] is True
+    assert "AUTO_SELF_HEALING_ENABLED" in payload["management"]["safe_hot_reload"]
+
+
 def test_score_factor_registry_exposes_scoring_and_gray_status():
     client = TestClient(app)
     response = client.get("/score/factors/registry")

@@ -106,7 +106,7 @@ def send_threshold_alerts(db: Session, snapshot: GoldScoreSnapshot) -> dict[str,
     if not alerts:
         return {"ok": True, "alerts_sent": 0, "message": "No alerts triggered."}
 
-    alert_text = "🔔 黄金走势监控 — 因子告警\n\n" + "\n".join(alerts) + "\n\n⚠️ 仅用于数据分析和风险提示，不构成投资建议。"
+    alert_text = "🔔 黄金走势监控 — 因子告警\n\n" + "\n".join(alerts) + "\n\n⚠️ 用于验证 AI 黄金预测系统可行性，不用于黄金买卖参考。"
 
     result = send_text_message(alert_text)
 

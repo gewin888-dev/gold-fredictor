@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ── 采集器定义 ──────────────────────────────────────────────────
 # (name, label, max_age_hours, critical)
 COLLECTOR_DEFS: list[dict[str, Any]] = [
-    {"name": "gold_price",           "label": "金价日线",     "max_age_hours": 1.0,    "critical": True},
+    {"name": "gold_price",           "label": "金价日线",     "max_age_hours": 12.0,   "critical": True},
     {"name": "intraday_snapshot",    "label": "日内快照",     "max_age_hours": 2.0,    "critical": True},
     {"name": "fred_data",            "label": "FRED宏观",     "max_age_hours": 25.0,   "critical": True},
     {"name": "cftc_position",        "label": "CFTC仓位",     "max_age_hours": 170.0,  "critical": True},

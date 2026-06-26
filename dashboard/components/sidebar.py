@@ -56,39 +56,47 @@ def render_sidebar(**kwargs):
             unsafe_allow_html=True,
         )
         st.divider()
-        st.markdown("### ⚙️ 自动优化")
+        st.markdown("### ⚙️ 自动驾驶")
         auto_config = api("/settings/auto-optimize")
         auto_settings = auto_config.get("settings", {})
-        new_score = st.toggle("评分参数自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS", False))
-        new_activate = st.toggle("达标自动激活", value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", False))
-        new_pred = st.toggle("预测模型自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", False))
-        new_pred_activate = st.toggle("预测模型自动激活", value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", False))
-        # 检测是否有未保存更改
-        if "_auto_initial" not in st.session_state:
-            st.session_state["_auto_initial"] = dict(auto_settings)
+        new_full_auto = st.toggle("实验全自动进化", value=auto_settings.get("AUTO_EVOLUTION_FULL_AUTO", True))
+        new_healing = st.toggle("自动评估与修复", value=auto_settings.get("AUTO_SELF_HEALING_ENABLED", True))
+        new_autofix = st.toggle("达标后自动修正", value=auto_settings.get("AUTO_SELF_HEALING_AUTOFIX", True))
+        with st.expander("高级模型开关", expanded=False):
+            st.caption("实验全自动模式不会放宽质量标准；候选版本必须通过严格门控才会自动激活。")
+            new_score = st.toggle("评分参数自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_SCORE_PARAMS", True))
+            new_activate = st.toggle("评分参数达标激活", value=auto_settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS", True))
+            new_pred = st.toggle("预测模型自动搜索", value=auto_settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL", True))
+            new_pred_activate = st.toggle("预测模型达标激活", value=auto_settings.get("AUTO_ACTIVATE_PREDICTION_MODEL", True))
         current_toggle = {
+            "AUTO_EVOLUTION_FULL_AUTO": new_full_auto,
+            "AUTO_SELF_HEALING_ENABLED": new_healing,
+            "AUTO_SELF_HEALING_AUTOFIX": new_autofix,
             "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
             "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
             "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
             "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
         }
+        if "_auto_initial" not in st.session_state:
+            st.session_state["_auto_initial"] = dict(current_toggle)
         has_unsaved = current_toggle != st.session_state["_auto_initial"]
         save_label = "💾 保存" + (" ●" if has_unsaved else "")
         if st.button(save_label, use_container_width=True):
             r = api("/settings/auto-optimize", "post", json={
+                "AUTO_EVOLUTION_FULL_AUTO": new_full_auto,
+                "AUTO_SELF_HEALING_ENABLED": new_healing,
+                "AUTO_SELF_HEALING_AUTOFIX": new_autofix,
                 "AUTO_OPTIMIZE_SCORE_PARAMS": new_score,
                 "AUTO_ACTIVATE_OPTIMIZED_PARAMS": new_activate,
                 "AUTO_OPTIMIZE_PREDICTION_MODEL": new_pred,
                 "AUTO_ACTIVATE_PREDICTION_MODEL": new_pred_activate,
             })
             if r.get("ok"):
-                st.session_state["_auto_initial"] = current_toggle
+                st.session_state["_auto_initial"] = dict(current_toggle)
                 st.success("已保存")
                 st.rerun()
         st.divider()
-        saved = st.session_state.get("_auto_saved", auto_settings)
-        pred_auto_text = "预测候选达标后受控自动激活" if saved.get("AUTO_ACTIVATE_PREDICTION_MODEL") else "预测候选仅生成，不自动激活"
-        st.caption(pred_auto_text)
+        st.caption("当前模式：AI 可行性验证全自动 + 严格质量门控。")
         st.divider()
     
         # ── API 密钥配置 ──
@@ -220,4 +228,3 @@ def render_sidebar(**kwargs):
         pass
     
     # ═══════════════════════════════════════════
-

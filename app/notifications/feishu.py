@@ -52,10 +52,12 @@ def build_score_alert_text(
     bj_ts = ts + timedelta(hours=8) if ts.tzinfo else ts.replace(tzinfo=timezone.utc) + timedelta(hours=8)
     bj_str = bj_ts.strftime("%Y-%m-%d %H:%M") if hasattr(bj_ts, "strftime") else str(bj_ts)
 
-    factor_scores = json.loads(score_snapshot.factor_scores)
+    factor_scores_raw = json.loads(score_snapshot.factor_scores)
+    # Handle v2 format: {"scores": {...}, "details": {...}}
+    factor_scores = factor_scores_raw.get("scores", factor_scores_raw) if isinstance(factor_scores_raw, dict) else {}
     risk_flags = json.loads(score_snapshot.risk_flags)
     factor_lines = "\n".join(
-        f"- {name}: {value}" for name, value in sorted(factor_scores.items(), key=lambda item: abs(item[1]), reverse=True)
+        f"- {name}: {value}" for name, value in sorted(factor_scores.items(), key=lambda item: abs(item[1]) if isinstance(item[1], (int, float)) else 0, reverse=True)
     )
     risk_lines = "\n".join(f"- {flag}" for flag in risk_flags)
 
@@ -84,7 +86,7 @@ def build_score_alert_text(
         f"{risk_lines or '- 暂无风险提示'}\n\n"
         f"未来事件:\n"
         f"{event_lines or '- 暂无未来事件'}\n\n"
-        f"说明: 本消息仅用于数据分析和风险提示，不构成投资建议。"
+        f"说明: 本消息用于验证 AI 黄金预测系统可行性，不用于黄金买卖参考。"
     )
 
 

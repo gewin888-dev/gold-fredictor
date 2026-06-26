@@ -767,7 +767,7 @@ def overfit_risk_assessment(result: dict[str, Any], baseline: dict[str, Any] | N
         level = "medium"
     return {
         "level": level,
-        "warnings": warnings or ["未触发明显过拟合警告，但仍需人工审核。"],
+        "warnings": warnings or ["未触发明显过拟合警告。"],
         "not_recommended_for_direct_activation": level != "low",
     }
 
