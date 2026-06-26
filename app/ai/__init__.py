@@ -119,7 +119,7 @@ def _build_prompt(snapshot: GoldScoreSnapshot) -> str:
 
     return f"""你是一位专业的黄金市场量化分析师。请基于以下量化评分数据，提供简洁的市场解读。
 
-⚠️ 重要：只解读数据，不给出投资建议。用中文回复。
+⚠️ 重要：只解读数据和预测能力，不用于黄金买卖参考。用中文回复。
 
 ## 评分概览
 - 总分：{snapshot.total_score:+.1f}（范围 -100 ~ +100）
@@ -190,7 +190,7 @@ def _call_deepseek(prompt: str) -> dict[str, Any] | None:
                 "role": "system",
                 "content": (
                     "你是一位黄金市场量化分析师。只基于提供的量化数据做解读，"
-                    "不编造信息，不给出投资建议。始终以 JSON 格式回复。"
+                    "不编造信息，不输出黄金买卖建议。始终以 JSON 格式回复。"
                 ),
             },
             {"role": "user", "content": prompt},

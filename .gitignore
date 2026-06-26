@@ -12,3 +12,6 @@ gold_monitor.db-journal
 *.backup.*
 *.db-wal
 *.db-shm
+node_modules/
+dist-app/
+npm-debug.log*

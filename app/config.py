@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -7,7 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT_DIR / ".env")
+ENV_PATH = Path(os.environ.get("GOLD_FREDICTOR_ENV_PATH", ROOT_DIR / ".env"))
+load_dotenv(ENV_PATH)
 
 
 class Settings(BaseSettings):
@@ -29,25 +31,29 @@ class Settings(BaseSettings):
         default="*",
         alias="PREDICTION_SCORE_SOURCES",
     )
-    auto_optimize_score_params: bool = Field(default=False, alias="AUTO_OPTIMIZE_SCORE_PARAMS")
-    auto_activate_optimized_params: bool = Field(default=False, alias="AUTO_ACTIVATE_OPTIMIZED_PARAMS")
+    auto_evolution_full_auto: bool = Field(default=True, alias="AUTO_EVOLUTION_FULL_AUTO")
+    auto_optimize_score_params: bool = Field(default=True, alias="AUTO_OPTIMIZE_SCORE_PARAMS")
+    auto_activate_optimized_params: bool = Field(default=True, alias="AUTO_ACTIVATE_OPTIMIZED_PARAMS")
     auto_optimize_min_hit_rate: float = Field(default=0.55, alias="AUTO_OPTIMIZE_MIN_HIT_RATE")
     auto_optimize_n_iter: int = Field(default=80, alias="AUTO_OPTIMIZE_N_ITER")
     auto_optimize_horizon_days: int = Field(default=20, alias="AUTO_OPTIMIZE_HORIZON_DAYS")
-    auto_optimize_prediction_model: bool = Field(default=False, alias="AUTO_OPTIMIZE_PREDICTION_MODEL")
-    auto_activate_prediction_model: bool = Field(default=False, alias="AUTO_ACTIVATE_PREDICTION_MODEL")
+    auto_optimize_prediction_model: bool = Field(default=True, alias="AUTO_OPTIMIZE_PREDICTION_MODEL")
+    auto_activate_prediction_model: bool = Field(default=True, alias="AUTO_ACTIVATE_PREDICTION_MODEL")
     auto_prediction_n_iter: int = Field(default=80, alias="AUTO_PREDICTION_N_ITER")
     auto_prediction_min_score: float = Field(default=40.0, alias="AUTO_PREDICTION_MIN_SCORE")
     auto_prediction_max_mape_pct: float = Field(default=8.0, alias="AUTO_PREDICTION_MAX_MAPE_PCT")
     auto_prediction_min_direction_accuracy: float = Field(default=0.52, alias="AUTO_PREDICTION_MIN_DIRECTION_ACCURACY")
     auto_prediction_min_samples: int = Field(default=120, alias="AUTO_PREDICTION_MIN_SAMPLES")
     auto_prediction_min_valid_horizons: int = Field(default=3, alias="AUTO_PREDICTION_MIN_VALID_HORIZONS")
+    auto_self_healing_enabled: bool = Field(default=True, alias="AUTO_SELF_HEALING_ENABLED")
+    auto_self_healing_autofix: bool = Field(default=True, alias="AUTO_SELF_HEALING_AUTOFIX")
     deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
     api_key: str = Field(default="", alias="API_KEY")
     deepseek_base_url: str = Field(default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL")
     deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    dashboard_api_base_url: str = Field(default="http://127.0.0.1:8000", alias="DASHBOARD_API_BASE_URL")
 
-    model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ENV_PATH), extra="ignore")
 
 
 @lru_cache

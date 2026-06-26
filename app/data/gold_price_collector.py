@@ -503,7 +503,7 @@ RECORD_INTERVAL_SECONDS = 60  # 每 60 秒记录一次
 
 def _intraday_recorder_loop():
     """后台线程：周期性记录金价快照。"""
-    from app.monitoring.collector_health import record_failure
+    from app.monitoring.collector_health import record_failure, record_success
 
     while not _recorder_stop.is_set():
         try:
@@ -512,7 +512,9 @@ def _intraday_recorder_loop():
             now = datetime.now(timezone.utc)
 
             # COMEX 活跃时段约为周日 22:00 UTC - 周五 21:00 UTC。
-            if not is_comex_market_closed(now):
+            if is_comex_market_closed(now):
+                record_success("intraday_snapshot", "market closed")
+            else:
                 record_intraday_snapshot()
         except Exception as e:
             record_failure("intraday_snapshot", f"recorder loop error: {str(e)[:200]}")
@@ -525,6 +527,8 @@ def start_intraday_recorder():
     if _recorder_thread is not None and _recorder_thread.is_alive():
         return
     _recorder_stop.clear()
+    # 即使在闭市时也保留一次当前报价，避免仪表盘在服务刚启动时没有可展示的曲线数据。
+    record_intraday_snapshot()
     _recorder_thread = threading.Thread(target=_intraday_recorder_loop, daemon=True)
     _recorder_thread.start()
 

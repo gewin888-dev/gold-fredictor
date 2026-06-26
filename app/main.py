@@ -32,6 +32,7 @@ from app.data.sge_collector import collect_china_gold_premium
 from app.database import get_db, init_db, serialized_write
 from app.config import get_settings
 from app.auto_settings import get_auto_settings, set_auto_settings
+from app.config_registry import get_config_audit
 from app.events.calendar import list_macro_events
 from app.models import (
     IntradaySnapshot,
@@ -48,6 +49,7 @@ from app.models import (
     ScoreParamsVersion,
 )
 from app.monitoring.health import get_data_health
+from app.monitoring.system_health import get_system_health
 from app.monitoring.threshold_alert import send_threshold_alerts
 from app.notifications.feishu import send_score_alert_with_health, send_text_message
 from app.scoring.gold_score import (
@@ -74,6 +76,7 @@ from app.scoring.score_optimizer import (
     save_best_params,
 )
 from app.scoring.factor_registry import factor_registry_payload
+from app.self_healing import get_self_healing_status, run_self_healing_cycle
 from app.ai import analyze_latest_score
 from app.ai.chat import (
     chat as ai_chat,
@@ -228,7 +231,7 @@ def _score_compare_payload(db: Session, row: ScoreParamsVersion) -> dict[str, An
         "recommendation": (
             "不建议直接激活，建议先做分段稳定性复核。"
             if overfit["not_recommended_for_direct_activation"]
-            else "未触发明显过拟合警告，但仍建议人工审核后激活。"
+            else "未触发明显过拟合警告，可交由自动门控处理。"
         ),
     }
 
@@ -648,6 +651,11 @@ def data_health(db: Session = Depends(get_db)) -> dict[str, object]:
     return get_data_health(db)
 
 
+@app.get("/health/system")
+def system_health(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_system_health(db)
+
+
 @app.post("/collect/fred")
 def collect_fred(db: Session = Depends(get_db)) -> dict[str, object]:
     with serialized_write():
@@ -819,6 +827,9 @@ def load_all_sample_data(db: Session = Depends(get_db)) -> dict[str, object]:
 def compute_score(db: Session = Depends(get_db)) -> dict[str, object]:
     with serialized_write():
         snapshot = auto_score_and_broadcast(db)
+    from app.monitoring.collector_health import record_success
+
+    record_success("score_engine", f"score={snapshot.total_score}")
     return serialize_score(snapshot)
 
 
@@ -966,7 +977,7 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
     latest_prediction_candidate = db.scalar(
         select(PredictionModelVersion).order_by(PredictionModelVersion.created_at.desc())
     )
-    prediction_min_samples = int(settings.get("AUTO_PREDICTION_MIN_SAMPLES") or 120)
+    prediction_min_samples = int(settings.get("AUTO_PREDICTION_MIN_SAMPLES") or 30)
     evaluation = prediction_evaluation_summary(db)
     due_status = prediction_due_status_summary(db, min_samples=prediction_min_samples)
     summary = evaluation.get("summary", {}) if evaluation.get("ok") else {}
@@ -977,7 +988,7 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
     score_ready = bool(
         latest_score_candidate
         and latest_score_candidate.sample_count is not None
-        and latest_score_candidate.sample_count >= 120
+        and latest_score_candidate.sample_count >= prediction_min_samples
     )
     prediction_ready = bool(due_status.get("can_evolve"))
     reasons: list[str] = []
@@ -1030,6 +1041,9 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
             "sample_threshold": prediction_min_samples,
             "auto_search_enabled": bool(settings.get("AUTO_OPTIMIZE_PREDICTION_MODEL")),
             "auto_activate_enabled": bool(settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")),
+            "self_healing_enabled": bool(settings.get("AUTO_SELF_HEALING_ENABLED", True)),
+            "self_healing_autofix": bool(settings.get("AUTO_SELF_HEALING_AUTOFIX", True)),
+            "full_auto": bool(settings.get("AUTO_EVOLUTION_FULL_AUTO", True)),
             "last_prediction_action": {
                 "action": latest_prediction_audit.action,
                 "from_version": latest_prediction_audit.from_version,
@@ -1041,11 +1055,9 @@ def _model_health_status(db: Session, settings: dict[str, object] | None = None)
         },
         "policy": {
             "auto_search_allowed": True,
-            "auto_activate_default": bool(settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")),
-            "manual_review_required": not (
-                settings.get("AUTO_ACTIVATE_OPTIMIZED_PARAMS")
-                or settings.get("AUTO_ACTIVATE_PREDICTION_MODEL")
-            ),
+            "auto_activate_default": bool(settings.get("AUTO_SELF_HEALING_AUTOFIX", True)),
+            "mode": "ai_validation_full_auto" if settings.get("AUTO_EVOLUTION_FULL_AUTO", True) else "guarded",
+            "manual_review_required": False,
         },
     }
 
@@ -1060,12 +1072,20 @@ def auto_optimize_settings(db: Session = Depends(get_db)) -> dict[str, object]:
     }
 
 
+@app.get("/config/audit")
+def config_audit(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_config_audit(db)
+
+
 @app.post("/settings/auto-optimize")
 def update_auto_optimize_settings(
     payload: dict[str, bool],
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     allowed = {
+        "AUTO_EVOLUTION_FULL_AUTO",
+        "AUTO_SELF_HEALING_ENABLED",
+        "AUTO_SELF_HEALING_AUTOFIX",
         "AUTO_OPTIMIZE_SCORE_PARAMS",
         "AUTO_ACTIVATE_OPTIMIZED_PARAMS",
         "AUTO_OPTIMIZE_PREDICTION_MODEL",
@@ -1082,6 +1102,16 @@ def update_auto_optimize_settings(
         "health": _model_health_status(db, settings),
         "message": "自动优化开关已保存到数据库；未修改 .env 或任何密钥字段。",
     }
+
+
+@app.get("/self-healing/status")
+def self_healing_status(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_self_healing_status(db)
+
+
+@app.post("/self-healing/run")
+def self_healing_run(force: bool = False, db: Session = Depends(get_db)) -> dict[str, object]:
+    return run_self_healing_cycle(db, force=force, reason="api")
 
 
 # ── 评分模型自我优化 API ──────────────────────────────────────────
@@ -1389,6 +1419,12 @@ def ai_insight(db: Session = Depends(get_db)) -> dict[str, object]:
 
 # ── .env 配置读写 ──
 
+def _env_path() -> Path:
+    import os
+
+    return Path(os.environ.get("GOLD_FREDICTOR_ENV_PATH", Path(__file__).resolve().parents[1] / ".env"))
+
+
 class EnvUpdateRequest(BaseModel):
     updates: dict[str, str] = Field(default_factory=dict)
 
@@ -1396,8 +1432,7 @@ class EnvUpdateRequest(BaseModel):
 @app.get("/settings/env")
 def get_env_config() -> dict[str, object]:
     """读取当前 .env 配置（敏感值打码）。"""
-    from pathlib import Path as _Path
-    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    env_path = _env_path()
     env_dict: dict[str, str] = {}
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").split("\n"):
@@ -1411,9 +1446,9 @@ def get_env_config() -> dict[str, object]:
 @app.post("/settings/env")
 def update_env_config(payload: EnvUpdateRequest) -> dict[str, object]:
     """更新 .env 配置（只更新提供的 key，保留其他不变）。"""
-    from pathlib import Path as _Path
-    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    env_path = _env_path()
     updates = payload.updates
+    env_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 读取现有内容
     current: dict[str, str] = {}

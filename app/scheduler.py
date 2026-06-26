@@ -30,6 +30,7 @@ from app.scoring.gold_predictor import (
     rollback_degraded_prediction_model,
 )
 from app.scoring.score_optimizer import activate_version, get_active_params, optimize_score_params, save_best_params
+from app.self_healing import run_self_healing_cycle
 
 
 def _collect_sp500_snapshot(db: Session) -> None:
@@ -199,63 +200,43 @@ def collect_and_score_job() -> None:
         _tick("commit")
 
         # 优先使用激活的优化参数
-        active_params = get_active_params(db)
-        if active_params is not None:
-            snapshot = compute_and_store_gold_score_with_params(db, active_params, source="optimized_active")
-        else:
-            snapshot = compute_and_store_gold_score(db)
-        _tick(f"score({snapshot.total_score})")
+        try:
+            active_params = get_active_params(db)
+            if active_params is not None:
+                snapshot = compute_and_store_gold_score_with_params(db, active_params, source="optimized_active")
+            else:
+                snapshot = compute_and_store_gold_score(db)
+            record_success("score_engine", f"score={snapshot.total_score}")
+            _tick(f"score({snapshot.total_score})")
+        except Exception:
+            logger.exception("评分引擎执行失败，已跳过（不中断整体流程）")
+            record_failure("score_engine", "scoring crashed")
+            snapshot = None
 
         # 记录一次预测快照，并评估已到期的历史预测。
-        predict_gold_prices(db, persist=True)
-        evaluate_due_predictions(db)
-        rollback_degraded_prediction_model(db)
-        _tick("predict")
-
-        # 安全网：如果激活模型方向准确率接近0且存在更好的候选，自动切换
         try:
-            from app.models import PredictionModelVersion
-            from app.scoring.gold_predictor import _active_prediction_model, activate_prediction_model_version
-            active_model = _active_prediction_model(db)
-            if active_model is not None and (active_model.direction_accuracy or 0.0) < 0.05 \
-                    and (active_model.evaluated_count or 0) >= 5:
-                # 查找更好的候选
-                candidates = db.scalars(
-                    select(PredictionModelVersion)
-                    .where(
-                        PredictionModelVersion.is_active == False,  # noqa: E712
-                        PredictionModelVersion.direction_accuracy > 0.2,
-                        PredictionModelVersion.evaluated_count >= 10,
-                    )
-                    .order_by(PredictionModelVersion.direction_accuracy.desc())
-                ).all()
-                if candidates:
-                    best = candidates[0]
-                    logger.warning(
-                        "安全网触发：激活模型 %s 方向准确率 %.1f%%，自动切换到 %s (%.1f%%)",
-                        active_model.version,
-                        (active_model.direction_accuracy or 0) * 100,
-                        best.version,
-                        (best.direction_accuracy or 0) * 100,
-                    )
-                    activate_prediction_model_version(db, best.version)
-                    record_failure("prediction_engine",
-                                   f"安全网切换: {active_model.version}({active_model.direction_accuracy}) -> {best.version}({best.direction_accuracy})")
-            else:
-                record_success("prediction_engine", f"model={active_model.version}" if active_model else "no_model")
+            predict_gold_prices(db, persist=True)
+            evaluate_due_predictions(db)
+            rollback_degraded_prediction_model(db)
+            record_success("prediction_engine", "predict/evaluate ok")
+            _tick("predict")
         except Exception:
-            logger.debug("预测模型安全网检查跳过", exc_info=True)
+            logger.exception("预测引擎执行失败，已跳过（不中断整体流程）")
+            record_failure("prediction_engine", "prediction crashed")
 
-        # 自动进化桥接：预测不准 → 搜索更优参数
+        # 无人值守自我评估/自我修正/自我进化闭环。
         try:
-            from app.auto_evolve import auto_evolve_if_needed
-            auto_evolve_if_needed(db)
+            healing = run_self_healing_cycle(db, reason="collect_and_score_job")
+            _tick(f"self_healing({healing.get('status')})")
         except Exception:
-            logger.debug("自动进化检查跳过", exc_info=True)
+            logger.debug("自动驾驶闭环检查跳过", exc_info=True)
 
-        # 阈值告警（因子突变即时推送）
-        send_threshold_alerts(db, snapshot)
-        _tick("threshold_alerts")
+        # 阈值告警（因子突变即时推送）—— 需有评分快照
+        if snapshot is not None:
+            send_threshold_alerts(db, snapshot)
+            _tick("threshold_alerts")
+        else:
+            logger.warning("阈值告警跳过：评分快照不可用")
 
         # 每小时推送精简版，每日完整版（UTC 22:00 是北京时间 06:00）
         from datetime import datetime, timezone
@@ -283,16 +264,17 @@ def collect_and_score_job() -> None:
                     collector_status = f"✅ 采集器正常（{h.get('summary',{}).get('healthy',0)}/{h.get('summary',{}).get('total',0)}）"
             except Exception:
                 collector_status = "采集器状态：检查失败"
-            send_score_alert_with_health(snapshot, get_data_health(db), events, collector_status)
+            send_score_alert_with_health(snapshot, get_data_health(db), events, collector_status) if snapshot is not None else None
     finally:
         db.close()
 
 
 def auto_optimize_job() -> None:
-    """受控自我优化：保存候选评分/预测参数；默认不自动激活。"""
+    """无人值守自我优化：按配置搜索并自动激活候选参数。"""
     db = SessionLocal()
     try:
         settings = resolved_auto_settings(db)
+        min_samples = int(settings.get("AUTO_PREDICTION_MIN_SAMPLES") or 120)
         if not settings["AUTO_OPTIMIZE_SCORE_PARAMS"] and not settings["AUTO_OPTIMIZE_PREDICTION_MODEL"]:
             return
 
@@ -327,7 +309,7 @@ def auto_optimize_job() -> None:
                         and hit_rate is not None
                         and float(hit_rate) >= float(settings["AUTO_OPTIMIZE_MIN_HIT_RATE"])
                         and saved.sample_count
-                        and saved.sample_count >= 120
+                        and saved.sample_count >= min_samples
                         and activation_check.get("eligible")
                     ):
                         activate_version(db, version)
@@ -345,8 +327,8 @@ def auto_optimize_job() -> None:
                     "min_score": settings["AUTO_PREDICTION_MIN_SCORE"],
                     "max_mape_price_pct": settings["AUTO_PREDICTION_MAX_MAPE_PCT"],
                     "min_direction_accuracy": settings["AUTO_PREDICTION_MIN_DIRECTION_ACCURACY"],
-                    "min_samples": settings["AUTO_PREDICTION_MIN_SAMPLES"],
-                    "min_valid_horizons": 3,
+                    "min_samples": min_samples,
+                    "min_valid_horizons": settings.get("AUTO_PREDICTION_MIN_VALID_HORIZONS", 3),
                     "min_baseline_lift": 0.03,
                     "max_mape_worse_ratio": 1.2,
                     "max_recent_degradation": 0.05,
@@ -368,7 +350,7 @@ def create_scheduler() -> BackgroundScheduler:
         id="hourly_collect_and_score",
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=300,
+        misfire_grace_time=1800,
     )
 
     # 央行购金：每 15 天执行一次（UTC 周一 08:00）

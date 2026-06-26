@@ -15,6 +15,9 @@ from app.models import AppSetting
 
 
 AUTO_SWITCH_KEYS = (
+    "AUTO_EVOLUTION_FULL_AUTO",
+    "AUTO_SELF_HEALING_ENABLED",
+    "AUTO_SELF_HEALING_AUTOFIX",
     "AUTO_OPTIMIZE_SCORE_PARAMS",
     "AUTO_ACTIVATE_OPTIMIZED_PARAMS",
     "AUTO_OPTIMIZE_PREDICTION_MODEL",
@@ -22,6 +25,9 @@ AUTO_SWITCH_KEYS = (
 )
 
 AUTO_SETTING_FIELDS: dict[str, tuple[str, str]] = {
+    "AUTO_EVOLUTION_FULL_AUTO": ("auto_evolution_full_auto", "bool"),
+    "AUTO_SELF_HEALING_ENABLED": ("auto_self_healing_enabled", "bool"),
+    "AUTO_SELF_HEALING_AUTOFIX": ("auto_self_healing_autofix", "bool"),
     "AUTO_OPTIMIZE_SCORE_PARAMS": ("auto_optimize_score_params", "bool"),
     "AUTO_ACTIVATE_OPTIMIZED_PARAMS": ("auto_activate_optimized_params", "bool"),
     "AUTO_OPTIMIZE_PREDICTION_MODEL": ("auto_optimize_prediction_model", "bool"),

@@ -15,7 +15,7 @@ def test_compute_gold_score_returns_expected_shape(db_session):
     assert result.direction in {"偏多", "中性", "偏空"}
     assert {"实际利率", "名义利率", "美元指数", "避险情绪", "通胀预期", "黄金趋势"}.issubset(result.factor_scores)
     assert result.risk_flags
-    assert "不构成投资建议" not in result.summary
+    assert "黄金买卖参考" not in result.summary
     assert "仅用于数据分析和风险提示" in result.summary
 
 

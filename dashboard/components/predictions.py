@@ -35,7 +35,7 @@ def render_predictions(**kwargs):
     def get_prediction() -> tuple[dict, str]:
         """返回 (data_dict, error_msg)。error_msg 为空时表示成功。"""
         try:
-            with httpx.Client(timeout=httpx.Timeout(45)) as c:
+            with httpx.Client(timeout=httpx.Timeout(45), trust_env=False) as c:
                 r = c.get(f"{API_BASE_URL}/predict/gold")
                 if r.status_code != 200:
                     return {}, f"API 返回状态 {r.status_code}"
@@ -119,7 +119,7 @@ def render_predictions(**kwargs):
                 best = opt_result.get("best") or {}
                 activation = opt_result.get("activation") or {}
                 overfit = activation.get("overfit_risk") or {}
-                mode = "已自动激活" if activation.get("activated") else "等待人工激活"
+                mode = "已自动激活" if activation.get("activated") else "等待自动门控"
                 st.success(
                     f"已生成候选模型 {opt_result.get('saved_version')}："
                     f"综合分 {best.get('optimization_score')}，"
@@ -377,4 +377,3 @@ def render_predictions(**kwargs):
     
     st.divider()
     st.markdown('<a id="macro-indicators"></a>', unsafe_allow_html=True)
-

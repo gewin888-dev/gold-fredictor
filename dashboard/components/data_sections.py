@@ -440,6 +440,7 @@ def render_data_sections(**kwargs):
                         f"{API_BASE_URL}/score/optimize",
                         params={"n_iter": n_iter, "horizon_days": horizon_days},
                         timeout=httpx.Timeout(600),
+                        trust_env=False,
                     )
                     r = resp.json() if resp.status_code == 200 else {}
                 except Exception:
@@ -488,7 +489,7 @@ def render_data_sections(**kwargs):
                     rr = api(
                         f"/score/params/{active_ver}/activate",
                         "post",
-                        json={"operator": "dashboard", "reason": "人工审核后在仪表盘激活"},
+                        json={"operator": "dashboard", "reason": "仪表盘调试覆盖激活"},
                     )
                     if rr.get("ok"):
                         st.success(f"已激活 {active_ver}")
@@ -504,7 +505,7 @@ def render_data_sections(**kwargs):
                     rr = api(
                         "/score/params/deactivate",
                         "post",
-                        json={"operator": "dashboard", "reason": "人工恢复默认评分规则"},
+                        json={"operator": "dashboard", "reason": "仪表盘调试覆盖恢复默认评分规则"},
                     )
                     if rr.get("ok"):
                         st.success("已恢复默认规则 v2")
@@ -561,8 +562,7 @@ def render_data_sections(**kwargs):
     
     st.divider()
     st.caption(
-        "本系统仅提供数据分析和风险提示，不构成任何投资建议。"
+        "本系统用于验证 AI 黄金预测系统可行性，不用于黄金买卖参考。"
         f" 数据刷新间隔 {st.session_state['_rf_interval']}s · "
         f"UTC {_now_utc().strftime('%Y-%m-%d %H:%M')} / 北京 {_now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-

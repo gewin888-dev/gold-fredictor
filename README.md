@@ -1,6 +1,6 @@
 # 黄金走势实时监控与预测系统
 
-一个 Python MVP，用于采集黄金价格、FRED 宏观数据、CFTC 持仓、中国黄金溢价、央行购金、新闻情绪和宏观事件，并通过规则评分、回测、预测、Streamlit 仪表盘和飞书告警做监控。系统只提供数据分析、评分和风险提示，不直接给出买入、卖出、加仓、减仓等投资建议。
+一个 Python MVP，用于测试“零代码基础借助 AI 开发黄金预测系统”的可行性。系统采集黄金价格、FRED 宏观数据、CFTC 持仓、中国黄金溢价、央行购金、新闻情绪和宏观事件，并通过规则评分、回测、预测、Streamlit 仪表盘和飞书告警做持续验证。系统默认启用无人值守自我评估、自我修复、自我搜索、自我激活和自我进化；结果只用于验证 AI 系统能否对标真实黄金走势，不用于黄金买卖参考，也不直接给出买入、卖出、加仓、减仓等建议。
 
 ## 功能
 
@@ -31,6 +31,8 @@ cp .env.example .env
 ```
 
 编辑 `.env`，填入 `FRED_API_KEY` 和 `NEWSAPI_KEY`。如果暂时没有飞书机器人，可保持 `FEISHU_WEBHOOK_URL` 为空。
+后期维护、配置审计和排障流程见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+桌面 App 使用说明见 [docs/DESKTOP_APP.md](docs/DESKTOP_APP.md)。
 
 默认情况下，API 启动只建表，不会自动联网采集或启动后台调度器。需要自动启动时可在 `.env` 设置：
 
@@ -39,6 +41,7 @@ AUTO_START_SCHEDULER=true
 AUTO_BOOTSTRAP_DATA=true
 PRODUCTION_MODE=true
 PREDICTION_SCORE_SOURCES=backfill_real_v2,rule_v2
+AUTO_EVOLUTION_FULL_AUTO=true
 NEWSAPI_DAILY_LIMIT=100
 ```
 
@@ -87,6 +90,21 @@ python scripts/send_score_alert.py
 streamlit run dashboard/streamlit_app.py
 ```
 
+启动桌面 App：
+
+```bash
+npm install
+npm run app
+```
+
+打包本机 App：
+
+```bash
+npm run app:pack
+```
+
+复制到其他 Mac 使用时，首次启动会在目标电脑的用户数据目录创建本地运行环境、配置文件和数据库；目标电脑需要已安装 `python3`，首次启动需要联网安装依赖。未做 Apple 签名/公证时，首次打开可能需要右键选择“打开”。
+
 可选启动 API：
 
 ```bash
@@ -97,6 +115,14 @@ uvicorn app.main:app --reload
 
 ```text
 http://127.0.0.1:8000/docs
+```
+
+统一管理入口：
+
+```bash
+.venv/bin/python scripts/manage.py health
+.venv/bin/python scripts/manage.py config --format table
+.venv/bin/python scripts/manage.py self-heal --force
 ```
 
 运行测试：
@@ -119,11 +145,12 @@ macOS 可以安装用户级 `launchd` 后台任务，让调度器在登录后自
 scripts/install_macos_launchd.sh
 ```
 
-日志写入 `logs/launchd.out.log` 和 `logs/launchd.err.log`。自我优化默认关闭；只有设置 `AUTO_OPTIMIZE_SCORE_PARAMS=true` 才会每周生成候选参数，只有同时设置 `AUTO_ACTIVATE_OPTIMIZED_PARAMS=true` 且命中率超过 `AUTO_OPTIMIZE_MIN_HIT_RATE` 才会自动激活。
+日志写入 `logs/launchd.out.log` 和 `logs/launchd.err.log`。自我优化默认开启；系统会自动生成候选参数，并在样本量、命中率、误差、baseline 提升和退化检查通过后自动激活。
 
 ## API
 
 - `GET /health`
+- `GET /config/audit`
 - `GET /health/data`
 - `GET /gold/price`
 - `GET /predict/gold`
@@ -230,11 +257,11 @@ summary 包括：
 - 平均未来收益
 - 多头、空头、中性样本数量
 
-该回测只用于评估评分规则的历史表现，不构成交易建议。
+该回测只用于评估评分规则的历史表现，不用于黄金买卖参考。
 
 ## 自我进化与模型健康
 
-系统支持受控自我进化：自动搜索候选评分参数和候选预测模型，但正式交付默认不自动激活。仪表盘中的“模型健康”会展示：
+系统支持全自动自我进化：自动搜索候选评分参数和候选预测模型，并在严格质量门控通过后自动激活。仪表盘中的“模型健康”会展示：
 
 - 当前评分参数版本：默认规则或激活版本。
 - 当前预测模型版本。

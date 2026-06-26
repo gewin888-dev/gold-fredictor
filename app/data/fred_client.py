@@ -57,9 +57,6 @@ class FredClient:
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.api_key:
             raise ValueError("FRED_API_KEY is not configured. Add it to .env first.")
-        if len(self.api_key) < 32:
-            raise ValueError(f"FRED_API_KEY looks truncated (len={len(self.api_key)}, expected 32). Check .env.")
-
         request_kwargs = {
             "params": {**params, "api_key": self.api_key, "file_type": "json"},
             "timeout": self.timeout,

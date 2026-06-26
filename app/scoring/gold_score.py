@@ -74,7 +74,7 @@ BONUS_FRED_SERIES = [
 ]
 TRUSTED_SCORING_SOURCES = {"FRED", "YAHOO", "CFTC", "GDELT", "WGC", "IMF", "SGE", "SINA", "LBMA", "TEST", "NEWSAPI", "GOOGLE_TRENDS", "SPDR", "CME", "CBOE", "MANUAL", "MANUAL_ESTIMATE"}
 # 中国溢价可信评分源
-PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST", "SINA", "MANUAL"}
+PREMIUM_TRUSTED_SOURCES = {"SGE", "LBMA", "TEST"}
 
 
 def _filter_registry_scored_factors(factor_scores: dict[str, float]) -> dict[str, float]:

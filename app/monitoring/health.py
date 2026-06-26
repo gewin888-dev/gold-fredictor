@@ -19,6 +19,13 @@ from app.models import (
 )
 
 CRITICAL_FRED_SERIES = {"DGS10", "DFII10", "T10YIE", "FEDFUNDS", "VIXCLS", "DTWEXBGS"}
+FREQUENCY_THRESHOLDS_DAYS = {
+    "daily": (7, 30),
+    "weekly": (21, 45),
+    "monthly": (60, 95),
+    "quarterly": (140, 220),
+    "annual": (430, 760),
+}
 
 
 def _utc_naive_now() -> datetime:
@@ -73,10 +80,11 @@ def get_data_health(db: Session) -> dict[str, Any]:
             .order_by(MacroObservation.timestamp.desc())
         )
         age = _age_days(row.timestamp if row else None)
-        if series.frequency == "monthly":
-            status = _status_from_age(age, warn_after_days=60, error_after_days=95)
-        else:
-            status = _status_from_age(age, warn_after_days=7, error_after_days=30)
+        warn_after, error_after = FREQUENCY_THRESHOLDS_DAYS.get(
+            series.frequency or "daily",
+            FREQUENCY_THRESHOLDS_DAYS["daily"],
+        )
+        status = _status_from_age(age, warn_after_days=warn_after, error_after_days=error_after)
         source = row.source if row else None
         critical = series.series_id in CRITICAL_FRED_SERIES
         items.append(

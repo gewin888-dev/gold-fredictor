@@ -12,3 +12,5 @@ SQLAlchemy==2.0.36
 streamlit==1.41.1
 uvicorn==0.34.0
 vaderSentiment==3.3.2
+plotly==6.8.0
+pytrends==4.9.2

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import re
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -21,6 +20,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from app.models import NewsSentiment
 
 NEWSAPI_URL = "https://newsapi.org/v2/everything"
+SENSITIVE_QUERY_RE = re.compile(r"([?&](?:apiKey|api_key|key|token|secret)=)[^&\s]+", re.IGNORECASE)
 
 # 黄金利多/利空关键词
 BULLISH = [
@@ -75,6 +75,10 @@ def _text_sentiment(title: str, description: str = "") -> float:
     return _gold_sentiment(title, description)
 
 
+def _redact_sensitive_url(text: str) -> str:
+    return SENSITIVE_QUERY_RE.sub(r"\1***", text)
+
+
 def collect_news_sentiment(
     db: Session,
     query: str = "gold price OR gold market",
@@ -102,8 +106,8 @@ def collect_news_sentiment(
         resp = requests.get(
             NEWSAPI_URL, params=params,
             headers={"User-Agent": "gold-fredictor/1.0"},
-            timeout=settings.newsapi_timeout_seconds,
-            verify=settings.newsapi_verify_ssl,
+            timeout=getattr(settings, "newsapi_timeout_seconds", 12),
+            verify=getattr(settings, "newsapi_verify_ssl", True),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -165,7 +169,7 @@ def collect_news_sentiment(
 
         return count
     except requests.RequestException as e:
-        raise RuntimeError(f"NewsAPI request failed: {e}") from e
+        raise RuntimeError(f"NewsAPI request failed: {_redact_sensitive_url(str(e))}") from e
 
 
 def get_recent_sentiment(db: Session, days: int = 7) -> float | None:

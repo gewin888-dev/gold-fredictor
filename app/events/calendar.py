@@ -59,6 +59,9 @@ def list_macro_events(db: Session, days_ahead: int = 30) -> list[MacroEvent]:
 
 def load_sample_macro_events(db: Session, base_time: datetime | None = None) -> int:
     base = base_time or datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    if base < now:
+        base = now
     base = base.replace(hour=12, minute=30, second=0, microsecond=0)
     events = [
         MacroEventInput(
