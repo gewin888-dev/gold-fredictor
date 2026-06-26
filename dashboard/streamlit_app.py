@@ -784,13 +784,13 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
-    # 💬 AI 助手 — 独立窗口打开
+    # 💬 AI 助手 — App 内独立窗口打开
     st.markdown("### 💬 AI 助手")
     st.markdown(
         '<a href="http://127.0.0.1:8000/ai/ui" target="_blank" style="text-decoration:none">'
         '<button style="width:100%;padding:8px;background:#334155;border:none;border-radius:6px;'
         'color:#e2e8f0;font-size:13px;cursor:pointer">'
-        '🔗 打开 AI 对话窗口</button></a>',
+        '💬 在 App 内打开 AI 对话</button></a>',
         unsafe_allow_html=True,
     )
     st.divider()

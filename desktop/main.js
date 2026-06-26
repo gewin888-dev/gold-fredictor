@@ -6,7 +6,9 @@ const path = require("path");
 
 const DASHBOARD_URL = "http://127.0.0.1:8501";
 const API_HEALTH_URL = "http://127.0.0.1:8000/health";
+const AI_CHAT_URL = "http://127.0.0.1:8000/ai/ui";
 let mainWindow = null;
+const childWindows = new Set();
 let serviceProcess = null;
 
 function isRunnableProjectRoot(root) {
@@ -108,11 +110,55 @@ function createWindow() {
 
   mainWindow.loadURL(DASHBOARD_URL);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAiChatUrl(url)) {
+      createAiChatWindow(url);
+      return { action: "deny" };
+    }
     shell.openExternal(url);
     return { action: "deny" };
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+}
+
+function isAiChatUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin === "http://127.0.0.1:8000" && parsed.pathname === "/ai/ui";
+  } catch {
+    return false;
+  }
+}
+
+function createAiChatWindow(url = AI_CHAT_URL) {
+  const chatWindow = new BrowserWindow({
+    width: 1080,
+    height: 760,
+    minWidth: 860,
+    minHeight: 620,
+    title: "AI 对话",
+    backgroundColor: "#0f172a",
+    parent: mainWindow || undefined,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+
+  childWindows.add(chatWindow);
+  chatWindow.loadURL(url);
+  chatWindow.webContents.setWindowOpenHandler(({ url: nextUrl }) => {
+    if (isAiChatUrl(nextUrl)) {
+      createAiChatWindow(nextUrl);
+    } else {
+      shell.openExternal(nextUrl);
+    }
+    return { action: "deny" };
+  });
+  chatWindow.on("closed", () => {
+    childWindows.delete(chatWindow);
   });
 }
 
