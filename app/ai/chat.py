@@ -299,20 +299,22 @@ def _build_system_context(db: Session) -> str:
     except Exception:
         pass
     try:
-        import sqlite3
-        db_raw = sqlite3.connect('gold_monitor.db')
-        cftc_n = db_raw.execute('SELECT COUNT(*) FROM cftc_positions').fetchone()[0]
-        cftc_latest = db_raw.execute('SELECT MAX(timestamp) FROM cftc_positions').fetchone()[0]
+        from sqlalchemy import text
+
+        connection = db.connection()
+        cftc_n = connection.execute(text("SELECT COUNT(*) FROM cftc_positions")).scalar() or 0
+        cftc_latest = connection.execute(text("SELECT MAX(timestamp) FROM cftc_positions")).scalar()
         diag_lines.append(f"- CFTC 数据: {cftc_n} 条，最新 {cftc_latest[:10] if cftc_latest else 'N/A'}")
         if cftc_n < 10:
             insights.append(f"⚠️ CFTC 仅 {cftc_n} 条记录（手工估算），建议接入实时 API。")
-        eval_pending = db_raw.execute(
-            "SELECT COUNT(*) FROM gold_prediction_snapshots s WHERE s.target_timestamp <= datetime('now') AND s.id NOT IN (SELECT prediction_id FROM gold_prediction_evaluations)"
-        ).fetchone()[0]
+        eval_pending = connection.execute(text(
+            "SELECT COUNT(*) FROM gold_prediction_snapshots s "
+            "WHERE s.target_timestamp <= datetime('now') "
+            "AND s.id NOT IN (SELECT prediction_id FROM gold_prediction_evaluations)"
+        )).scalar() or 0
         diag_lines.append(f"- 到期未评估预测: {eval_pending} 条")
         if eval_pending > 0:
             insights.append(f"⚠️ 有 {eval_pending} 条到期预测尚未评估，方向准确率统计可能滞后。")
-        db_raw.close()
     except Exception:
         pass
     if diag_lines:

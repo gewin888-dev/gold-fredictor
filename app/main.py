@@ -1419,6 +1419,12 @@ def ai_insight(db: Session = Depends(get_db)) -> dict[str, object]:
 
 # ── .env 配置读写 ──
 
+def _env_path() -> Path:
+    import os
+
+    return Path(os.environ.get("GOLD_FREDICTOR_ENV_PATH", Path(__file__).resolve().parents[1] / ".env"))
+
+
 class EnvUpdateRequest(BaseModel):
     updates: dict[str, str] = Field(default_factory=dict)
 
@@ -1426,8 +1432,7 @@ class EnvUpdateRequest(BaseModel):
 @app.get("/settings/env")
 def get_env_config() -> dict[str, object]:
     """读取当前 .env 配置（敏感值打码）。"""
-    from pathlib import Path as _Path
-    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    env_path = _env_path()
     env_dict: dict[str, str] = {}
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").split("\n"):
@@ -1441,9 +1446,9 @@ def get_env_config() -> dict[str, object]:
 @app.post("/settings/env")
 def update_env_config(payload: EnvUpdateRequest) -> dict[str, object]:
     """更新 .env 配置（只更新提供的 key，保留其他不变）。"""
-    from pathlib import Path as _Path
-    env_path = _Path(__file__).resolve().parents[1] / ".env"
+    env_path = _env_path()
     updates = payload.updates
+    env_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 读取现有内容
     current: dict[str, str] = {}

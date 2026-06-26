@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -7,7 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT_DIR / ".env")
+ENV_PATH = Path(os.environ.get("GOLD_FREDICTOR_ENV_PATH", ROOT_DIR / ".env"))
+load_dotenv(ENV_PATH)
 
 
 class Settings(BaseSettings):
@@ -51,7 +53,7 @@ class Settings(BaseSettings):
     deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
     dashboard_api_base_url: str = Field(default="http://127.0.0.1:8000", alias="DASHBOARD_API_BASE_URL")
 
-    model_config = SettingsConfigDict(env_file=str(ROOT_DIR / ".env"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ENV_PATH), extra="ignore")
 
 
 @lru_cache
