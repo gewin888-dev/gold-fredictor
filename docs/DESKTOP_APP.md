@@ -31,7 +31,13 @@ npm run app:dist
 
 产物输出到 `dist-app/`。当前打包结果是本机项目启动器：默认从项目根目录读取 `.venv`、`.env` 和本地数据库，不会把个人密钥、虚拟环境或数据库打进 App 包。
 
-如果把 App 移到项目目录之外运行，需要指定项目根目录：
+App 可以移动到桌面运行。启动时会按以下顺序查找项目根目录：
+
+1. `GOLD_FREDICTOR_PROJECT_ROOT`
+2. App 原始打包目录外层的项目目录
+3. 当前用户目录下的 `gold fredictor`
+
+如果项目目录也被移动，需要指定项目根目录：
 
 ```bash
 GOLD_FREDICTOR_PROJECT_ROOT="/Users/gewin/gold fredictor" \

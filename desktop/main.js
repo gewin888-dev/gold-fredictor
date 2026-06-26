@@ -24,6 +24,7 @@ function projectRoot() {
     const candidates = [
       process.env.GOLD_FREDICTOR_PROJECT_ROOT,
       path.resolve(process.resourcesPath, "../../../../.."),
+      path.join(app.getPath("home"), "gold fredictor"),
       path.join(process.resourcesPath, "app")
     ];
     const root = candidates.find(isRunnableProjectRoot);
